@@ -94,9 +94,9 @@ class RMSNorm(nn.Module):
 
 def precompute_freqs(
     dim: int,
-    end: int = int(32 * 1024),
-    rope_base: float = 1e6,
-    rope_scaling: Optional[dict] = None,
+    end: int,
+    rope_base: float,
+    rope_scaling: Optional[dict],
 ):
     # 1. 初始化标准 RoPE 频率。
     # torch.arange(0, dim, 2) 生成 [0, 2, 4, ... dim-2]
@@ -361,7 +361,7 @@ class MiniMindBlock(nn.Module):
             attention_mask,
         )
         hidden_states = res + hidden_states
-        
+
         # 2. FFN 子层（Pre-Norm + 残差）
         hidden_states = hidden_states + self.mlp(
             self.post_attention_layernorm(hidden_states)
@@ -376,7 +376,7 @@ class MiniMindModel(nn.Module):
         self.vocab_size, self.num_hidden_layers = (config.vocab_size, config.num_hidden_layers)
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.dropout = nn.Dropout(config.dropout)
-        self.layers = nn.ModuleList(
+        self.block_layers = nn.ModuleList(
             [MiniMindBlock(l, config) for l in range(self.num_hidden_layers)]
         )
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -404,14 +404,20 @@ class MiniMindModel(nn.Module):
         # 2. 创建缓存列表，如果 past_key_values 没有提供，则初始化为 None 的列表，长度与层数相同
         if hasattr(past_key_values, "layers"):
             past_key_values = None
-        
+        # past_key_values = [
+        #   (k0, v0),   # 第0层的 KV cache
+        #   (k1, v1),   # 第1层的 KV cache
+        #   (k2, v2),   # 第2层的 KV cache
+        #   ...
+        # ]
         past_key_values = past_key_values or [None] * len(self.layers)
         # 3. 计算start_pos：如果存在past，则start_pos为已有past序列长度，计算当前 token 的起始位置索引，以便从预计算的 RoPE 频率表中取出正确的位置编码
+        # k.shape = [batch, past_seq_len, num_kv_heads, head_dim]， v.shape = [batch, past_seq_len, num_kv_heads, head_dim]
         start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
         # 4. Embedding + dropout
         hidden_states = self.dropout(
             self.embed_tokens(input_ids)
-        ) 
+        )
 
         position_embeddings = (
             self.freqs_cos[start_pos : start_pos + seq_length],
@@ -419,10 +425,10 @@ class MiniMindModel(nn.Module):
         )
         
         presents = []
-        for layer_idx, (layer, past_key_value) in enumerate(
-            zip(self.layers, past_key_values)
+        for layer_idx, (block_layer, past_key_value) in enumerate(
+            zip(self.block_layers, past_key_values)
         ):
-            hidden_states, present = layer(
+            hidden_states, present = block_layer(
                 hidden_states,
                 position_embeddings,
                 past_key_value=past_key_value,
