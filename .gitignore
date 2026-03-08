@@ -121,3 +121,7 @@ clap-htsat-unfused
 # json 文件
 *.json
 **/*.json 
+
+# pth 文件
+*.pth
+**/*.pth

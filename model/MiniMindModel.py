@@ -410,7 +410,7 @@ class MiniMindModel(nn.Module):
         #   (k2, v2),   # 第2层的 KV cache
         #   ...
         # ]
-        past_key_values = past_key_values or [None] * len(self.layers)
+        past_key_values = past_key_values or [None] * len(self.block_layers)
         # 3. 计算start_pos：如果存在past，则start_pos为已有past序列长度，计算当前 token 的起始位置索引，以便从预计算的 RoPE 频率表中取出正确的位置编码
         # k.shape = [batch, past_seq_len, num_kv_heads, head_dim]， v.shape = [batch, past_seq_len, num_kv_heads, head_dim]
         start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
