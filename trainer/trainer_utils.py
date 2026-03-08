@@ -52,7 +52,7 @@ def lm_checkpoint(
     epoch=0,
     step=0,
     wandb=None,
-    save_dir="checkpoints",
+    save_dir=None,
     **kwargs,
 ):
     os.makedirs(save_dir, exist_ok=True)
@@ -118,7 +118,6 @@ def lm_checkpoint(
 
             return ckp_data
         return None
-
 
 # 初始化模型
 def init_model(
