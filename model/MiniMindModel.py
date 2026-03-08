@@ -515,6 +515,7 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
             
         # -------------------------------------------------------
         # 4. 封装输出，统一返回格式
+        # 注意力权重只在可视化分析时有用，正常训练推理不需要，且保存它会浪费大量显存，所以 MiniMind 直接不收集，设为默认 None
         # -------------------------------------------------------
         output = CausalLMOutputWithPast(
             loss=loss,
