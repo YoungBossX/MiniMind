@@ -203,14 +203,14 @@ class Attention(nn.Module):
 
         self.num_key_value_heads = (
             args.num_attention_heads
-            if self.num_key_value_heads is None
-            else self.num_key_value_heads
+            if args.num_key_value_heads is None
+            else args.num_key_value_heads
         )
         
         assert args.num_attention_heads % self.num_key_value_heads == 0
 
         self.n_local_heads = args.num_attention_heads
-        self.n_local_heads = self.num_key_value_heads
+        self.n_local_kv_heads = self.num_key_value_heads
         self.n_rep = args.num_attention_heads // self.num_key_value_heads
         self.head_dim = args.hidden_size // args.num_attention_heads
 
@@ -238,7 +238,7 @@ class Attention(nn.Module):
         ):
         # 1. 获取输入的 batch_size 和 seq_len
         batch_size, seq_len, _ = x.size()
-        # 2. 线性变换得到 q, k, v
+        # 2. 线性变换得到 q, k, v，q_proj 输出形状 (batch_size, seq_len, hidden_size)，k_proj 和 v_proj 输出形状 (batch_size, seq_len, num_key_value_heads * head_dim)
         xq = self.q_proj(x)
         xk = self.k_proj(x)
         xv = self.v_proj(x)
@@ -318,14 +318,14 @@ class FeedForward(nn.Module):
         # 6. 获取激活函数，ACT2FN 是一个字典，，让激活函数可以通过配置文件动态指定，而不是硬编码在代码里
         self.act_fn = ACT2FN[config.hidden_act]
 
-        def forward(self, x: torch.Tensor) -> torch.Tensor:
-            # 1. 计算前馈网络的升维输出和门控分支输出
-            gated = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
-            # 2. 计算前馈网络的降维输出
-            output = self.down_proj(gated)
-            # 3. 应用 dropout
-            output = self.dropout(output)
-            return output
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # 1. 计算前馈网络的升维输出和门控分支输出
+        gated = self.act_fn(self.gate_proj(x)) * self.up_proj(x)
+        # 2. 计算前馈网络的降维输出
+        output = self.down_proj(gated)
+        # 3. 应用 dropout
+        output = self.dropout(output)
+        return output
     
 class MiniMindBlock(nn.Module):
     def __init__(self, layer_id: int, config: MiniMindConfig):
@@ -335,7 +335,7 @@ class MiniMindBlock(nn.Module):
         self.head_dim = config.hidden_size // config.num_attention_heads
         self.attention = Attention(config)
         self.layer_id = layer_id
-        self.intput_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
@@ -354,7 +354,7 @@ class MiniMindBlock(nn.Module):
         # 1. 对输入的 hidden_states 进行层归一化，得到 normed_hidden_states
         res = hidden_states
         hidden_states, present_key_value = self.attention(
-            self.intput_layernorm(hidden_states),
+            self.input_layernorm(hidden_states),
             position_embeddings,
             past_key_value,
             use_cache,
@@ -470,7 +470,7 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
             use_cache=use_cache,
             **args,
         )
-        
+
         # -------------------------------------------------------
         # 2. 决定对哪些位置计算 logits
         #    logits_to_keep=0：保留所有位置（训练时）

@@ -113,3 +113,11 @@ clap-htsat-unfused
 *.db
 **/*.db
 .env
+
+# jsonl 文件
+*.jsonl
+**/*.jsonl
+
+# json 文件
+*.json
+**/*.json 
