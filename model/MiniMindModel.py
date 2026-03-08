@@ -351,7 +351,7 @@ class MiniMindBlock(nn.Module):
         use_cache=False,
         attention_mask: Optional[torch.Tensor] = None,
     ):
-        # 1. 对输入的 hidden_states 进行层归一化，得到 normed_hidden_states
+        # 1. 注意力子层（Pre-Norm + 残差）
         res = hidden_states
         hidden_states, present_key_value = self.attention(
             self.input_layernorm(hidden_states),
@@ -360,9 +360,9 @@ class MiniMindBlock(nn.Module):
             use_cache,
             attention_mask,
         )
-        # 2. 将注意力输出与残差连接相加，得到 attn_output
         hidden_states = res + hidden_states
-        # 3. 对 attn_output 进行层归一化，得到 normed_attn_output
+        
+        # 2. FFN 子层（Pre-Norm + 残差）
         hidden_states = hidden_states + self.mlp(
             self.post_attention_layernorm(hidden_states)
         )
