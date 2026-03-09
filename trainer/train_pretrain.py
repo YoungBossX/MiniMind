@@ -304,7 +304,8 @@ if __name__ == "__main__":
         # 📚 实验恢复知识点
         # 如果有检查点数据，获取之前的wandb_id来恢复实验
         wandb_id = ckp_data.get("wandb_id") if ckp_data else None
-        resume = "must" if wandb_id else None  # 必须恢复到指定实验
+        # 必须恢复到指定实验
+        resume = "must" if wandb_id else None
 
         # 构建实验名称，包含关键超参数
         wandb_run_name = f"MiniMind-Pretrain-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LearningRate-{args.learning_rate}"
