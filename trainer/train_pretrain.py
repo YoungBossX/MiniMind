@@ -90,8 +90,8 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             # labels 不为 None 时，模型内部会计算交叉熵损失
             res = model(input_ids, labels=labels, attention_mask=attention_mask)
 
-            # 标量 loss（float16 或 bfloat16）
-            loss = res.loss
+            # 预训练任务的总 loss = 主 loss + 辅助 loss
+            loss = (res.loss + res.aux_loss)
             
             # 梯度累积：把 loss 除以累积步数
             # 目的：模拟更大 batch_size，节省显存
@@ -233,7 +233,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--use_moe",
-        default=0,
+        default=1,
         type=int,
         choices=[0, 1],
         help="是否使用MoE架构（0=否，1=是）",
