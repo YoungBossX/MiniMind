@@ -2,17 +2,32 @@ import os
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import argparse
+# 计时，用于计算每个 epoch 的预计剩余时间
 import time
 import warnings
 import torch
+# 分布式训练通信库
 import torch.distributed as dist
+# 空上下文管理器（CPU 不支持 autocast 时使用）
 from contextlib import nullcontext
+# 优化器模块
 from torch import optim
+# DDP 多卡并行封装
 from torch.nn.parallel import DistributedDataParallel
+# 数据加载和分布式采样
 from torch.utils.data import DataLoader, DistributedSampler
-
+# 模型配置类
 from model.MiniMindModel import MiniMindConfig
+# 预训练数据集类
 from dataset.llm_dataset import PretrainDataset
+# 动态计算学习率（通常是 warmup + cosine decay）
+# 日志打印（只在主进程打印，避免多卡重复输出）
+# 判断当前进程是否是主进程（rank 0）
+# 保存 / 加载完整训练状态（断点续训）
+# 初始化分布式环境（读取 RANK、LOCAL_RANK 等环境变量）
+# 设置随机种子（torch / numpy / random）
+# 根据配置创建并初始化模型
+# 自定义采样器，用于跳过已经训练过的 batch（断点续训）
 from trainer.trainer_utils import (
     get_lr,
     Logger,
@@ -27,58 +42,111 @@ from trainer.trainer_utils import (
 # 忽略警告信息，保持输出清洁
 warnings.filterwarnings("ignore")
 
+# ============================================================
+# 核心训练函数：执行单个 epoch 的前向传播、反向传播、参数更新
+# ============================================================
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
-    start_time = time.time() # 记录开始时间
+    """
+    Args:
+        epoch      : 当前 epoch 编号（从 0 开始）
+        loader     : DataLoader 对象，迭代产出 (input_ids, labels, attention_mask)
+        iters      : 本 epoch 总 step 数（用于进度日志 & ETA 计算）
+        start_step : 断点续训时从哪个 step 开始（第一次训练为 0）
+        wandb      : 实验跟踪对象（swanlab / wandb），None 表示不使用
+    """
+    # 记录 epoch 开始时间，用于计算 ETA
+    start_time = time.time()
     
-    # 遍历数据批次
+    # enumerate(loader, start=start_step+1)：
+    #   - loader 每次迭代返回一个 batch
+    #   - start 参数让 step 从 start_step+1 开始计数，与断点续训对齐
+    # DataLoader 把多条样本拼成 batch，每条样本包含 input_ids、labels、attention_mask
     for step, (input_ids, labels, attention_mask) in enumerate(
         loader, start=start_step + 1
     ):
-        input_ids = input_ids.to(args.device)
-        labels = labels.to(args.device)
-        attention_mask = attention_mask.to(args.device)
+        # 将数据搬到指定设备（GPU 或 CPU）
+        input_ids = input_ids.to(args.device) # 形状: (batch_size, seq_len)
+        labels = labels.to(args.device) # 形状: (batch_size, seq_len)，是 input_ids 向右移一位
+        attention_mask = attention_mask.to(args.device) # 形状: (batch_size, seq_len)，1 = 有效 token，0 = padding
 
+        # ── 动态学习率计算 ──────────────────────────────────────────────
+        # get_lr 通常实现 warmup + cosine decay 调度：
+        #   - 前 warmup 步线性从 0 升到 learning_rate
+        #   - 之后按余弦曲线下降到 min_lr
+        # epoch * iters + step = 全局 step 编号
+        # args.epochs * iters  = 总 step 数（用于 cosine decay 终点）
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
 
+        # 将新学习率写入优化器所有参数组（AdamW 通常只有一个参数组）
         for param_group in optimizer.param_groups:
             param_group["lr"] = lr
         
+        # ── 前向传播（在混合精度上下文中执行）──────────────────────────
+        # autocast_ctx：
+        #   - GPU: torch.amp.autocast，自动把合适的运算降为 bfloat16/float16
+        #   - CPU: nullcontext（空操作），不做任何精度转换
         with autocast_ctx:
-            # 前向传播
+            # 调用模型前向，返回包含 .loss 的输出对象
+            # labels 不为 None 时，模型内部会计算交叉熵损失
             res = model(input_ids, labels=labels, attention_mask=attention_mask)
 
+            # 标量 loss（float16 或 bfloat16）
             loss = res.loss
-
+            
+            # 梯度累积：把 loss 除以累积步数
+            # 目的：模拟更大 batch_size，节省显存
             loss = loss / args.accumulation_steps
-           
+
+        # ── 反向传播 ──────────────────────────────────────────────────
+        # scaler.scale(loss)：将 loss 乘以缩放因子（防止 float16 下梯度下溢）
+        # .backward()：计算所有参数的梯度，并累加到 .grad 上
         scaler.scale(loss).backward()
 
+        # ── 参数更新（每 accumulation_steps 步执行一次）───────────────
         if step % args.accumulation_steps == 0:
-            # scaler.unscale_(): 还原梯度的真实值
+            # unscale_：将梯度除回缩放因子，还原真实梯度值
+            # 必须在 clip_grad_norm_ 之前调用，否则裁剪的是放大后的梯度
             scaler.unscale_(optimizer)
 
+            # 梯度裁剪：将所有参数梯度的 L2 范数限制在 grad_clip 以内
+            # 防止梯度爆炸，稳定训练
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
 
-            # 优化器更新知识点
-            # scaler.step(): 执行参数更新
-            # scaler.update(): 更新scaler的缩放因子
+            # scaler.step(optimizer)：
+            #   - 检查梯度是否含有 inf/nan（float16 溢出时出现）
+            #   - 若正常：调用 optimizer.step() 更新参数
+            #   - 若异常：跳过本次更新，避免参数被污染
             scaler.step(optimizer)
+
+            # scaler.update()：
+            #   - 根据上一步是否发生溢出，动态调整缩放因子
+            #   - 溢出 → 缩小缩放因子；连续正常 → 逐渐放大缩放因子
             scaler.update()
 
+            # 清空梯度，set_to_none=True 比 zero_grad() 更省显存
+            # （直接释放梯度张量，而非填充 0）
             optimizer.zero_grad(set_to_none=True)
-        
-        if step % args.log_interval == 0 or step == iters:
-            spend_time = time.time() - start_time
-            current_loss = loss.item() * args.accumulation_steps  # 恢复真实损失值
-            current_lr = optimizer.param_groups[-1]["lr"]  # 当前学习率
 
+        # ── 日志打印 ─────────────────────────────────────────────────
+        if step % args.log_interval == 0 or step == iters:
+            # 已用时间（秒）
+            spend_time = time.time() - start_time
+            # 恢复真实 loss（之前除以了 accumulation_steps）
+            current_loss = loss.item() * args.accumulation_steps
+            # 当前实际学习率
+            current_lr = optimizer.param_groups[-1]["lr"]
+
+            # 预计剩余时间（分钟）：
+            # spend_time / (step+1) = 每 step 平均耗时
+            # * iters = 本 epoch 总耗时估计
+            # // 60 - spend_time // 60 = 剩余分钟数
             eta_min = spend_time / (step + 1) * iters // 60 - spend_time // 60
 
             Logger(
                 f"Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}) loss:{current_loss:.6f} lr:{current_lr:.12f} epoch_Time:{eta_min}min:"
             )
 
-            # 记录到实验跟踪系统
+            # 上报指标到实验跟踪系统（如 SwanLab / WandB）
             if wandb:
                 wandb.log(
                     {"loss": current_loss, "lr": current_lr, "epoch_Time": eta_min}
@@ -87,25 +155,28 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
         if (step % args.save_interval == 0 or step == iters) and is_main_process():
             model.eval() # 切换到评估模式
 
-            # 构建保存路径
+            # 构建保存文件路径
+            # MoE 模型额外加 "_moe" 后缀，方便区分
             moe_suffix = (
                 "_moe" if hasattr(lm_config, "use_moe") and lm_config.use_moe else ""
             )
             ckp = f"{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth"
 
-            # 分布式模型保存知识点
-            # DDP模型需要通过.module访问真正的模型
+            # DDP 模型有额外封装层，真正的模型在 .module 属性里
+            # 非 DDP 模型直接调用 state_dict()
             if isinstance(model, torch.nn.parallel.DistributedDataParallel):
                 state_dict = model.module.state_dict()
             else:
                 state_dict = model.state_dict()
 
-            # 半精度保存知识点
-            # 将float32参数转为float16，减少存储空间
+            # 将所有参数从 float32 转为 float16（半精度）再保存
+            # 优点：文件大小减半，加载更快
+            # 代价：精度略有损失（推理时通常可以接受）
             state_dict = {k: v.half() for k, v in state_dict.items()}
             torch.save(state_dict, ckp)
 
-            # 保存完整训练状态
+            # 保存完整训练状态（用于断点续训）：
+            # 包含 model weights、optimizer state、scaler state、epoch、step、wandb_id
             lm_checkpoint(
                 lm_config,
                 weight=args.save_weight,
@@ -118,7 +189,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
                 save_dir="../checkpoints",
             )
 
-            model.train() # 恢复训练模式
+            model.train()
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MiniMind Pretraining")
@@ -183,7 +254,7 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--from_resume",
-        default=0,
+        default=1,
         type=int,
         choices=[0, 1],
         help="是否自动检测&续训（0=否，1=是）",
@@ -221,7 +292,7 @@ if __name__ == "__main__":
     - 构建模型配置对象
     - 尝试加载断点续训数据
     """
-    os.makedirs(args.save_dir, exist_ok=True)  # 确保保存目录存在
+    os.makedirs(args.save_dir, exist_ok=True) # 确保保存目录存在
 
     # 创建MiniMind模型配置
     lm_config = MiniMindConfig(
