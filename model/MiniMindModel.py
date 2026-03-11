@@ -779,6 +779,7 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
         self,
         input_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        loss_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
         past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
         use_cache: bool = False,
@@ -832,9 +833,13 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
             loss = F.cross_entropy(
                 shift_logits.view(-1, shift_logits.size(-1)), # [B×(seq_len-1), vocab_size]
                 shift_labels.view(-1), # [B×(seq_len-1)]
-                ignore_index=-100, # labels 中 -100 的位置不计算损失（padding 或 prompt 部分）
-            )
-            
+                reduction='none',
+            ).view(shift_labels.size()) # [B, seq_len-1]
+
+            if loss_mask is not None:
+                loss = loss * loss_mask[:, 1:] # 只对有效位置计算损失
+            else :
+                loss = loss.mean() # 平均所有位置的损失
         # -------------------------------------------------------
         # 4. 封装输出，统一返回格式
         # 注意力权重只在可视化分析时有用，正常训练推理不需要，且保存它会浪费大量显存，所以 MiniMind 直接不收集，设为默认 None
