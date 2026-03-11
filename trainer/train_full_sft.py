@@ -132,9 +132,7 @@ if __name__ == "__main__":
     local_rank = init_distributed_mode()  # 初始化分布式环境
     if dist.is_initialized():
         args.device = f"cuda:{local_rank}"  # 分布式训练时使用对应GPU
-    setup_seed(
-        42 + (dist.get_rank() if dist.is_initialized() else 0)
-    )  # 不同进程使用不同种子
+    setup_seed(42 + (dist.get_rank() if dist.is_initialized() else 0))  # 不同进程使用不同种子
 
     # ========== 2. 配置目录、模型参数、检查点 ==========
     """
@@ -142,7 +140,7 @@ if __name__ == "__main__":
     - 通常from_weight='pretrain'，表示加载预训练权重
     - Pretrain脚本中from_weight='none'表示从头开始
     """
-    os.makedirs(args.save_dir, exist_ok=True)  # 确保保存目录存在
+    os.makedirs(args.save_dir, exist_ok=True) # 确保保存目录存在
     lm_config = MiniMindConfig(
         hidden_size=args.hidden_size,
         num_hidden_layers=args.num_hidden_layers,
