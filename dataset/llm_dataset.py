@@ -333,7 +333,6 @@ class DPODataset(Dataset):
 #   - 返回值是 dict{"prompt": str, "answer": str}，而非 tensor，
 #     这是 RL 数据集与 SL 数据集（返回 tensor）的最显著差异。
 # ──────────────────────────────────────────────────────────────────────────────
-
 class RLAIFDataset(Dataset):
     def __init__(self, file_path, tokenizer, max_length=1024):
         super().__init__(self)

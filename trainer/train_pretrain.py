@@ -61,13 +61,13 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
     #   - loader 每次迭代返回一个 batch
     #   - start 参数让 step 从 start_step+1 开始计数，与断点续训对齐
     # DataLoader 把多条样本拼成 batch，每条样本包含 input_ids、labels、attention_mask
-    for step, (input_ids, labels, attention_mask) in enumerate(
+    for step, (input_ids, labels, loss_mask) in enumerate(
         loader, start=start_step + 1
     ):
         # 将数据搬到指定设备（GPU 或 CPU）
         input_ids = input_ids.to(args.device) # 形状: (batch_size, seq_len)
         labels = labels.to(args.device) # 形状: (batch_size, seq_len)，是 input_ids 向右移一位
-        attention_mask = attention_mask.to(args.device) # 形状: (batch_size, seq_len)，1 = 有效 token，0 = padding
+        loss_mask = loss_mask.to(args.device) # 形状: (batch_size, seq_len)，1 = 需要计算 loss，0 = 跳过
 
         # ── 动态学习率计算 ──────────────────────────────────────────────
         # get_lr 通常实现 warmup + cosine decay 调度：
@@ -88,7 +88,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
         with autocast_ctx:
             # 调用模型前向，返回包含 .loss 的输出对象
             # labels 不为 None 时，模型内部会计算交叉熵损失
-            res = model(input_ids, labels=labels, attention_mask=attention_mask)
+            res = model(input_ids, labels=labels, loss_mask=loss_mask)
 
             # 预训练任务的总 loss = 主 loss + 辅助 loss
             loss = (res.loss + res.aux_loss)
@@ -220,8 +220,7 @@ if __name__ == "__main__":
 
     # ========== 数据和恢复参数 ==========
     parser.add_argument("--data_path", type=str, default="../dataset/pretrain_hq.jsonl", help="预训练数据路径",)
-    parser.add_argument("--from_weight", default="none", type=str, help="基于哪个权重训练，为none则从头开始",
-    )
+    parser.add_argument("--from_weight", default="none", type=str, help="基于哪个权重训练，为none则从头开始")
     parser.add_argument("--from_resume", default=1, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
 
     # ========== 实验跟踪参数 ==========
