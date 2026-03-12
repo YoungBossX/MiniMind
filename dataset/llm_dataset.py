@@ -139,7 +139,17 @@ class SFTDataset(Dataset):
         for i, turn in enumerate(conversations):
             # 偶数轮为用户，奇数轮为助手
             role = 'user' if i % 2 == 0 else 'assistant'
-            messages.append({"role": role, "content": turn['content']})
+            messages.append({"role": turn['role'], "content": turn['content']})
+
+        tools = (
+            conversations[0]["functions"]
+            if (
+                conversations
+                and conversations[0]["role"] == "system"
+                and conversations[0].get("functions")
+            )
+            else None
+        )
 
         # 返回字符串形式的 prompt，而非直接 tokenize
         return self.tokenizer.apply_chat_template(
@@ -335,7 +345,7 @@ class DPODataset(Dataset):
 # ──────────────────────────────────────────────────────────────────────────────
 class RLAIFDataset(Dataset):
     def __init__(self, file_path, tokenizer, max_length=1024):
-        super().__init__(self)
+        super().__init__()
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.padding = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
@@ -344,8 +354,16 @@ class RLAIFDataset(Dataset):
         self.bos_id = tokenizer('<|im_start|>assistant', add_special_tokens=False).input_ids
         self.eos_id = tokenizer('<|im_end|>', add_special_tokens=False).input_ids
 
+        # 加载 JSONL 格式数据：每行为一个 dict，有 chosen 和 rejected
+        with open(file_path, 'r', encoding='utf-8') as f:
+            self.data = []
+            for line in f:
+                line = line.strip()
+                obj = json.loads(line)
+                self.data.append(obj)
+
     def __len__(self):
-        return len(self.samples)
+        return len(self.data)
 
     def create_chat_prompt(self, conversations):
         messages = []
@@ -365,7 +383,7 @@ class RLAIFDataset(Dataset):
         return prompt, answer
     
     def __getitem__(self, index):
-        sample = self.samples[index]
+        sample = self.data[index]
         prompt, answer = self.create_chat_prompt(sample["conversations"])
 
         return {"prompt": prompt, "answer": answer}

@@ -56,6 +56,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
     """
     # 记录 epoch 开始时间，用于计算 ETA
     start_time = time.time()
+    local_step = 0
     
     # enumerate(loader, start=start_step+1)：
     #   - loader 每次迭代返回一个 batch
@@ -63,7 +64,8 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
     # DataLoader 把多条样本拼成 batch，每条样本包含 input_ids、labels、attention_mask
     for step, (input_ids, labels, loss_mask) in enumerate(
         loader, start=start_step + 1
-    ):
+    ):  
+        local_step += 1
         # 将数据搬到指定设备（GPU 或 CPU）
         input_ids = input_ids.to(args.device) # 形状: (batch_size, seq_len)
         labels = labels.to(args.device) # 形状: (batch_size, seq_len)，是 input_ids 向右移一位
@@ -140,7 +142,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             # spend_time / (step+1) = 每 step 平均耗时
             # * iters = 本 epoch 总耗时估计
             # // 60 - spend_time // 60 = 剩余分钟数
-            eta_min = spend_time / (step + 1) * iters // 60 - spend_time // 60
+            eta_min = spend_time / local_step * (iters - step) // 60
 
             Logger(
                 f"Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}) loss:{current_loss:.6f} lr:{current_lr:.12f} epoch_Time:{eta_min}min:"

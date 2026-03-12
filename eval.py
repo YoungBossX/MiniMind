@@ -1,8 +1,6 @@
 import os
 import argparse
-import random
 import warnings
-import numpy as np
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer
 from model.MiniMindModel import MiniMindConfig, MiniMindForCausalLM
@@ -33,6 +31,13 @@ def init_model(args):
             torch.load(ckp, map_location=args.device), strict=True
         )
 
+        if args.lora_weight != "None":
+            from model.model_lora import apply_lora, load_lora
+            lora_path = os.path.join(BASE_DIR, args.save_dir, f"{args.lora_weight}.pth")
+            apply_lora(model)
+            load_lora(model, lora_path)
+            print(f"[LoRA] 已加载权重: {lora_path}")
+
     else:
         model = AutoModelForCausalLM.from_pretrained(
             args.load_from, trust_remote_code=True
@@ -60,7 +65,7 @@ def main():
         help="模型权重目录")
     parser.add_argument(
         "--weight",
-        default="pretrain",
+        default="full_sft",
         type=str,
         help="权重名称前缀（pretrain, full_sft, rlhf, reason, ppo_actor, grpo, spo）",
     )
@@ -180,7 +185,6 @@ def main():
         )
         conversation.append({"role": "assistant", "content": response})
         print("\n\n")
-
 
 if __name__ == "__main__":
     main()

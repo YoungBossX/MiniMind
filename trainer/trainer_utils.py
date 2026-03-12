@@ -1,6 +1,7 @@
 import os
 import random
 import math
+import shutil
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -81,10 +82,12 @@ def lm_checkpoint(
         # 先写到 .tmp 临时文件，写完再用 os.replace 原子替换
         # 目的：防止写到一半程序崩溃导致文件损坏
         # os.replace 是原子操作，不会出现"替换到一半"的中间状态
+        # half()：float32 → float16，文件大小减半，推理时精度损失可接受
         ckp_tmp = ckp_path + ".tmp"
         torch.save({k: v.half() for k, v in state_dict.items()}, ckp_tmp)
-        # half()：float32 → float16，文件大小减半，推理时精度损失可接受
-        os.replace(ckp_tmp, ckp_path)
+        # Windows 上 os.replace 的限制：目标文件被其他进程占用时，Windows 不允许替换，Linux 没有这个问题
+        # os.replace(ckp_tmp, ckp_path)
+        shutil.move(ckp_tmp, ckp_path)
 
         # ── 获取 wandb 实验 id（用于续训时恢复到同一个实验）──────────
         wandb_id = None
@@ -130,7 +133,9 @@ def lm_checkpoint(
         # ── 保存完整训练状态（同样用 tmp + replace 原子写入）─────────
         resume_tmp = resume_path + ".tmp"
         torch.save(resume_data, resume_tmp)
-        os.replace(resume_tmp, resume_path)
+        # Windows 上 os.replace 的限制：目标文件被其他进程占用时，Windows 不允许替换，Linux 没有这个问题
+        # os.replace(resume_tmp, resume_path)
+        shutil.move(resume_tmp, resume_path)
 
     # ================================================================
     # 加载模式（model 为 None，只传了 lm_config 和 weight）
@@ -166,6 +171,7 @@ def init_model(
     lm_config,
     from_weight=None,
     tokenizer_path=None,
+    lora_weight="None", 
     save_dir="../out",
     device="cuda",
 ):
@@ -194,6 +200,16 @@ def init_model(
         weights = torch.load(weight_path, map_location=device)
 
         model.load_state_dict(weights, strict=False)
+
+    if lora_weight != "None":
+        from model.model_lora import apply_lora, load_lora
+        apply_lora(model)   # 插入 LoRA 结构（训练和推理都需要）
+        lora_path = f"{save_dir}/{lora_weight}.pth"
+        if os.path.exists(lora_path):
+            load_lora(model, lora_path) # 加载已训练的权重（仅推理需要）
+            Logger(f"[LoRA] 已加载权重: {lora_path}")
+        else:
+            Logger(f"[LoRA] 结构已插入，从头开始训练")
 
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     Logger(f"所加载Model可训练参数：{total_params / 1e6:.3f} 百万")

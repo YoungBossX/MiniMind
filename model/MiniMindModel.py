@@ -758,7 +758,7 @@ class MiniMindModel(nn.Module):
                     block_layer.mlp, MoEFeedForward
                 )
             ],
-            hidden_states.new_zeros(1).squeeze(),
+            hidden_states.new_zeros(1).squeeze()
         )
         
         return hidden_states, presents, aux_loss
@@ -828,17 +828,15 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
             # labels: [t0, t1, t2, t3, t4] → 去掉第一个  → [t1, t2, t3, t4]
             #
             # 含义：用 t0 预测 t1，用 t1 预测 t2，以此类推
-            shift_logits = logits[..., :-1, :].contiguous() # shape: [B, seq_len-1, vocab_size]
-            shift_labels = labels[..., 1:].contiguous() # shape: [B, seq_len-1]
             loss = F.cross_entropy(
-                shift_logits.view(-1, shift_logits.size(-1)), # [B×(seq_len-1), vocab_size]
-                shift_labels.view(-1), # [B×(seq_len-1)]
+                logits.view(-1, logits.size(-1)), # [B×(seq_len-1), vocab_size]
+                labels.view(-1), # [B×(seq_len-1)]
+                ignore_index=-100, 
                 reduction='none',
-            ).view(shift_labels.size()) # [B, seq_len-1]
+            ).view(labels.size()) # [B, seq_len-1]
 
             if loss_mask is not None:
-                loss_mask = loss_mask[:, 1:] # 只对有效位置计算损失
-                loss = (loss * loss_mask).sum() / loss_mask.sum()
+                loss = (loss * loss_mask).sum() / loss_mask.sum().clamp(min=1)
             else :
                 loss = loss.mean() # 平均所有位置的损失
         # -------------------------------------------------------
