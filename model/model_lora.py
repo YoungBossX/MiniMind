@@ -18,7 +18,7 @@ def apply_lora(model, rank=8):
     device = next(model.parameters()).device
     for name, module in model.named_modules():
         if (isinstance(module, nn.Linear) and module.weight.shape[0] == module.weight.shape[1]):
-            lora = LoRA(module.weight.shape[0], module.weight.shape[1], rank=rank).to(device)
+            lora = LoRA(module.weight.shape[1], module.weight.shape[0], rank=rank).to(device)
             setattr(module, "lora", lora)
             original_forward = module.forward
 
