@@ -837,7 +837,8 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
             ).view(shift_labels.size()) # [B, seq_len-1]
 
             if loss_mask is not None:
-                loss = loss * loss_mask[:, 1:] # 只对有效位置计算损失
+                loss_mask = loss_mask[:, 1:] # 只对有效位置计算损失
+                loss = (loss * loss_mask).sum() / loss_mask.sum()
             else :
                 loss = loss.mean() # 平均所有位置的损失
         # -------------------------------------------------------

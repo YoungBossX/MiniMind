@@ -35,7 +35,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
 
         scaler.scale(loss).backward()
 
-        if  step % args.accumulation_steps == 0:
+        if step % args.accumulation_steps == 0:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             scaler.step(optimizer)
@@ -96,7 +96,7 @@ if __name__ == "__main__":
     # ========== 硬件和性能参数 ==========
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu", help="训练设备")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="混合精度类型")
-    parser.add_argument("--num_workers", type=int, default=4, help="数据加载线程数")
+    parser.add_argument("--num_workers", type=int, default=2, help="数据加载线程数")
 
     # ========== 训练策略参数 ==========
     parser.add_argument("--accumulation_steps", type=int, default=8, help="梯度累积步数")
