@@ -19,10 +19,12 @@ warnings.filterwarnings('ignore')
 
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
     start_time = time.time()
+    local_step = 0
     for step, (input_ids, labels, loss_mask) in enumerate(loader, start=start_step + 1):
         input_ids = input_ids.to(args.device)
         labels = labels.to(args.device)
         loss_mask = loss_mask.to(args.device)
+        local_step += 1
 
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
         for param_group in optimizer.param_groups:
@@ -48,7 +50,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             current_aux_loss = res.aux_loss.item() if res.aux_loss is not None else 0.0
             current_logits_loss = current_loss - current_aux_loss
             current_lr = optimizer.param_groups[-1]["lr"]
-            eta_min = spend_time / (step + 1) * iters // 60 - spend_time // 60
+            eta_min = spend_time / local_step * (iters - step) // 60
 
             Logger(f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), loss: {current_loss:.4f}, logits_loss: {current_logits_loss:.4f}, aux_loss: {current_aux_loss:.4f}, lr: {current_lr:.8f}, epoch_time: {eta_min:.1f}min')
             

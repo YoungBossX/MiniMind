@@ -137,8 +137,6 @@ class SFTDataset(Dataset):
         """
         messages = []
         for i, turn in enumerate(conversations):
-            # 偶数轮为用户，奇数轮为助手
-            role = 'user' if i % 2 == 0 else 'assistant'
             messages.append({"role": turn['role'], "content": turn['content']})
 
         tools = (
@@ -155,7 +153,8 @@ class SFTDataset(Dataset):
         return self.tokenizer.apply_chat_template(
             messages,
             tokenize=False,
-            add_generation_prompt=False
+            add_generation_prompt=False,
+            tools=tools
         )
 
     def _generate_loss_mask(self, input_ids):
