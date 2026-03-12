@@ -20,4 +20,8 @@ warnings.filterwarnings('ignore')
 def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
     for step, (input_ids, labels, loss_mask) in enumerate(dataloader, start_step + 1):
         input_ids, labels, loss_mask = input_ids.to(args.device), labels.to(args.device), loss_mask.to(args.device)
-        
+        lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
+        for param_group in optimizer.param_groups:
+            param_group['lr'] = lr
+        with autocast_ctx:
+            
