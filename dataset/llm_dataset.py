@@ -205,8 +205,10 @@ class SFTDataset(Dataset):
         X = torch.tensor(input_ids[:-1], dtype=torch.long)         # 输入序列
         Y = torch.tensor(input_ids[1:], dtype=torch.long)          # 目标标签（shifted）
         loss_mask = torch.tensor(loss_mask[1:], dtype=torch.long)  # 对齐 Y 的位置（从第一个预测 token 开始）
+        # 对其 X ，提供注意力机制中的掩码
+        attention_mask = torch.tensor([1 if id != self.tokenizer.pad_token_id else 0 for id in input_ids[:-1]], dtype=torch.long)
 
-        return X, Y, loss_mask
+        return X, Y, loss_mask, attention_mask
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 3. DPODataset —— 比较学习（Direct Preference Optimization）数据集

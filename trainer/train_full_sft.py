@@ -20,10 +20,11 @@ warnings.filterwarnings('ignore')
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
     start_time = time.time()
     local_step = 0
-    for step, (input_ids, labels, loss_mask) in enumerate(loader, start=start_step + 1):
+    for step, (input_ids, labels, loss_mask, attention_mask) in enumerate(loader, start=start_step + 1):
         input_ids = input_ids.to(args.device)
         labels = labels.to(args.device)
         loss_mask = loss_mask.to(args.device)
+        attention_mask = attention_mask.to(args.device)
         local_step += 1
 
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
@@ -31,7 +32,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             param_group["lr"] = lr
 
         with autocast_ctx:
-            res = model(input_ids, labels=labels, loss_mask=loss_mask)
+            res = model(input_ids, attention_mask=attention_mask, labels=labels, loss_mask=loss_mask)
             loss = res.loss + res.aux_loss
             loss = loss / args.accumulation_steps
 
@@ -84,7 +85,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             model.train()
             del state_dict
 
-        del input_ids, labels, res, loss
+        del input_ids, labels, loss_mask, attention_mask, res, loss
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MiniMind Full SFT")

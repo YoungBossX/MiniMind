@@ -21,8 +21,8 @@ def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
     start_time = time.time()
     local_step = 0
 
-    for step, (input_ids, labels, loss_mask) in enumerate(loader, start_step + 1):
-        input_ids, labels, loss_mask = input_ids.to(args.device), labels.to(args.device), loss_mask.to(args.device)
+    for step, (input_ids, labels, loss_mask, attention_mask) in enumerate(loader, start_step + 1):
+        input_ids, labels, loss_mask, attention_mask = input_ids.to(args.device), labels.to(args.device), loss_mask.to(args.device), attention_mask.to(args.device)
         local_step += 1
 
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
@@ -41,11 +41,8 @@ def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
         # GPU上 → 前向计算自动用半精度，省显存提速
         # CPU上 → 什么都不做，正常执行
         with autocast_ctx:
-            res = model(input_ids, labels=labels, loss_mask=loss_mask)
-            loss = res.loss + res.aux_loss
-            loss = loss / args.accumulation_steps
-
-        loss = (res.loss + res.aux_loss) / args.accumulation_steps
+            res = model(input_ids, attention_mask=attention_mask, labels=labels, loss_mask=loss_mask)
+            loss = (res.loss + res.aux_loss) / args.accumulation_steps
 
         # scaler.scale(loss): 放大损失值，防止float16下的梯度下溢
         # .backward(): 计算梯度，填充到各参数的.grad属性
