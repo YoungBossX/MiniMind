@@ -91,8 +91,10 @@ class PretrainDataset(Dataset):
         X = torch.tensor(input_ids[:-1], dtype=torch.long)         # 输入：[0, ..., n-2]
         Y = torch.tensor(input_ids[1:], dtype=torch.long)          # 目标：[1, ..., n-1]
         loss_mask = torch.tensor(loss_mask[1:], dtype=torch.long)  # loss_mask 对齐目标 Y
+        # 对其 X ，提供注意力机制中的掩码
+        attention_mask = torch.tensor([1 if id != self.tokenizer.pad_token_id else 0 for id in input_ids[:-1]], dtype=torch.long)
 
-        return X, Y, loss_mask
+        return X, Y, loss_mask, attention_mask
     
 # ──────────────────────────────────────────────────────────────────────────────
 # 2. SFTDataset —— 有监督微调（Supervised Fine-Tuning）数据集

@@ -62,7 +62,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
     #   - loader 每次迭代返回一个 batch
     #   - start 参数让 step 从 start_step+1 开始计数，与断点续训对齐
     # DataLoader 把多条样本拼成 batch，每条样本包含 input_ids、labels、attention_mask
-    for step, (input_ids, labels, loss_mask) in enumerate(
+    for step, (input_ids, labels, loss_mask, attention_mask) in enumerate(
         loader, start=start_step + 1
     ):  
         local_step += 1
@@ -70,7 +70,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
         input_ids = input_ids.to(args.device) # 形状: (batch_size, seq_len)
         labels = labels.to(args.device) # 形状: (batch_size, seq_len)，是 input_ids 向右移一位
         loss_mask = loss_mask.to(args.device) # 形状: (batch_size, seq_len)，1 = 需要计算 loss，0 = 跳过
-
+        attention_mask = attention_mask.to(args.device) # 形状: (batch_size, seq_len)，1 = 有效 token，0 = padding
         # ── 动态学习率计算 ──────────────────────────────────────────────
         # get_lr 通常实现 warmup + cosine decay 调度：
         #   - 前 warmup 步线性从 0 升到 learning_rate
@@ -90,7 +90,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
         with autocast_ctx:
             # 调用模型前向，返回包含 .loss 的输出对象
             # labels 不为 None 时，模型内部会计算交叉熵损失
-            res = model(input_ids, labels=labels, loss_mask=loss_mask)
+            res = model(input_ids, attention_mask=attention_mask, labels=labels, loss_mask=loss_mask)
 
             # 预训练任务的总 loss = 主 loss + 辅助 loss
             loss = (res.loss + res.aux_loss)

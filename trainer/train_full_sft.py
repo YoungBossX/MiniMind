@@ -114,7 +114,7 @@ if __name__ == "__main__":
 
     # ========== 数据和恢复参数 ==========
     parser.add_argument("--data_path", type=str, default="../dataset/sft_mini_512.jsonl", help="预训练数据路径")
-    parser.add_argument("--from_weight", default="none", type=str, help="基于哪个权重训练，为none则从头开始")
+    parser.add_argument("--from_weight", default="pretrain", type=str, help="基于哪个权重训练，为none则从头开始")
     parser.add_argument("--from_resume", default=1, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
 
     # ========== 实验跟踪参数 ==========

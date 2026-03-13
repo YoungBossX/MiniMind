@@ -33,7 +33,7 @@ def init_model(args):
 
         if args.lora_weight != "None":
             from model.model_lora import apply_lora, load_lora
-            lora_path = os.path.join(BASE_DIR, args.save_dir, f"{args.lora_weight}.pth")
+            lora_path = os.path.join(BASE_DIR, args.lora_dir, f"{args.lora_weight}_{args.hidden_size}{moe_suffix}.pth")
             apply_lora(model)
             load_lora(model, lora_path)
             print(f"[LoRA] 已加载权重: {lora_path}")
@@ -63,6 +63,11 @@ def main():
         default="out", 
         type=str, 
         help="模型权重目录")
+    parser.add_argument(
+        "--lora_dir", 
+        default="out\\lora", 
+        type=str, 
+        help="LoRA权重目录")
     parser.add_argument(
         "--weight",
         default="full_sft",
