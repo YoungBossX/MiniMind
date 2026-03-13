@@ -274,8 +274,13 @@ class DPODataset(Dataset):
         )
 
         # 转换为 token ID 列表，长度为 max_length
-        chosen_input_ids = chosen_encoding['input_ids']           # shape: (max_length,)
-        rejected_input_ids = rejected_encoding['input_ids']       # shape: (max_length,)
+        chosen_input_ids = chosen_encoding['input_ids'] # shape: (max_length,)
+        rejected_input_ids = rejected_encoding['input_ids'] # shape: (max_length,)
+
+        # 直接从 encoding 取出 attention_mask
+        # tokenizer 自动生成：真实token=1，PAD=0
+        chosen_attention_mask   = chosen_encoding['attention_mask']    # [max_length]
+        rejected_attention_mask = rejected_encoding['attention_mask']  # [max_length]
 
         # 构造 loss mask：仅在 assistant 段落（<|im_start|>assistant ... <|im_end|>）中的 token 参与损失
         chosen_loss_mask = self._generate_loss_mask(chosen_input_ids)     # shape: (max_length,)
@@ -291,14 +296,20 @@ class DPODataset(Dataset):
         y_rejected = torch.tensor(rejected_input_ids[1:], dtype=torch.long)   # shape: (max_length - 1,)
         mask_rejected = torch.tensor(rejected_loss_mask[1:], dtype=torch.long)# shape: (max_length - 1,)
 
+        # X = input_ids[:-1]，attention_mask 也取 [:-1]
+        attention_mask_chosen = torch.tensor(chosen_attention_mask[:-1],   dtype=torch.long)
+        attention_mask_rejected = torch.tensor(rejected_attention_mask[:-1], dtype=torch.long)
+
         return {
             'x_chosen': x_chosen,           # shape: (max_length - 1,)
             'y_chosen': y_chosen,           # shape: (max_length - 1,)
             'mask_chosen': mask_chosen,     # shape: (max_length - 1,)
+            'attention_mask_chosen': attention_mask_chosen, # shape: (max_length - 1,)
 
             'x_rejected': x_rejected,       # shape: (max_length - 1,)
             'y_rejected': y_rejected,       # shape: (max_length - 1,)
             'mask_rejected': mask_rejected  # shape: (max_length - 1,)
+            'attention_mask_rejected': attention_mask_rejected, # shape: (max_length - 1,)
         }
 
     def _generate_loss_mask(self, input_ids):

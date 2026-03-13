@@ -180,7 +180,7 @@ if __name__ == "__main__":
     # use_wandb: 是否启用WandB/SwanLab进行实验跟踪
     # wandb_project: WandB项目的名称，用于组织实验
     parser.add_argument("--use_wandb", action="store_true", help="是否使用wandb")
-    parser.add_argument("--wandb_project", type=str, default="MokioMind-LoRA", help="wandb项目名")
+    parser.add_argument("--wandb_project", type=str, default="MiniMind-LoRA", help="wandb项目名")
 
     args = parser.parse_args()
 
@@ -207,7 +207,7 @@ if __name__ == "__main__":
     os.makedirs(args.save_dir, exist_ok=True)
 
     # 📚 模型配置初始化
-    # MokioMindConfig: 定义模型的超参数，如隐藏维度、层数、是否使用MoE
+    # MiniMindConfig: 定义模型的超参数，如隐藏维度、层数、是否使用MoE
     lm_config = MiniMindConfig(
         hidden_size=args.hidden_size,
         num_hidden_layers=args.num_hidden_layers,
@@ -253,7 +253,7 @@ if __name__ == "__main__":
 
         # 📚 实验名称生成
         # 包含关键参数，便于识别不同的实验配置
-        wandb_run_name = f"MokioMind-LoRA-{args.lora_name}-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LR-{args.learning_rate}"
+        wandb_run_name = f"MiniMind-LoRA-{args.lora_name}-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LR-{args.learning_rate}"
         wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
     
     # ========== 5. 定义模型、应用LoRA、冻结非LoRA参数 ==========
