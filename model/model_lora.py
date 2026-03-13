@@ -13,6 +13,9 @@ class LoRA(nn.Module):
         kaiming_uniform_(self.A.weight, a=math.sqrt(5))
         # 矩阵 B 全 0 初始化
         self.B.weight.data.zero_()
+
+    def forward(self, x):
+        return self.B(self.A(x))
     
 def apply_lora(model, rank=8):
     device = next(model.parameters()).device

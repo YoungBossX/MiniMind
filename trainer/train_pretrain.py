@@ -286,9 +286,7 @@ if __name__ == "__main__":
 
     # 📚 上下文管理器知识点
     # CPU不支持autocast，使用nullcontext作为空操作
-    autocast_ctx = (
-        nullcontext() if device_type == "cpu" else torch.amp.autocast(device_type=device_type, dtype=dtype)
-    )
+    autocast_ctx = (nullcontext() if device_type == "cpu" else torch.amp.autocast(device_type=device_type, dtype=dtype))
 
     # ========== 4. 配置WandB实验跟踪 ==========
     """

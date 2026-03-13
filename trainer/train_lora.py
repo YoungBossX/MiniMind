@@ -21,7 +21,7 @@ def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
     start_time = time.time()
     local_step = 0
 
-    for step, (input_ids, labels, loss_mask) in enumerate(dataloader, start_step + 1):
+    for step, (input_ids, labels, loss_mask) in enumerate(loader, start_step + 1):
         input_ids, labels, loss_mask = input_ids.to(args.device), labels.to(args.device), loss_mask.to(args.device)
         local_step += 1
 
@@ -133,11 +133,19 @@ if __name__ == "__main__":
     parser.add_argument("--save_dir", type=str, default="../out/lora", help="LoRA权重保存目录")
     parser.add_argument("--lora_name", type=str, default="lora_identity", help="LoRA权重名称标识")
 
-    # 📚 训练超参数
+    # 📚 训练设备和精度配置
     # device: 指定训练使用的设备（GPU/CPU）
     # dtype: 混合精度训练的数据类型，bfloat16更稳定，float16更高效
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu", help="训练设备")
     parser.add_argument("--dtype", type=str, default="bfloat16", help="混合精度类型")
+
+    # 📚 训练超参数
+    # epochs: 训练的总轮数，控制模型训练的完整程度
+    # batch_size: 每个批次的样本数量，影响显存使用和训练稳定性
+    # learning_rate: 初始学习率，控制参数更新的步长
+    parser.add_argument("--learning_rate", type=float, default=1e-4, help="初始学习率")
+    parser.add_argument("--epochs", type=int, default=50, help="训练轮数")
+    parser.add_argument("--batch_size", type=int, default=32, help="batch size")
 
     # 📚 数据加载和训练优化
     # num_workers: 数据加载的并行进程数，提高数据读取效率
@@ -160,7 +168,7 @@ if __name__ == "__main__":
     # use_moe: 是否使用Mixture of Experts架构，提高模型效率
     parser.add_argument("--hidden_size", type=int, default=512, help="模型隐藏层维度")
     parser.add_argument("--num_hidden_layers", type=int, default=8, help="Transformer层数")
-    parser.add_argument("--max_seq_len", type=int, default=521, help="训练的最大截断长度")
+    parser.add_argument("--max_seq_len", type=int, default=512, help="训练的最大截断长度")
     parser.add_argument("--use_moe", default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
 
     # 📚 数据和权重配置
@@ -231,7 +239,7 @@ if __name__ == "__main__":
     # 📚 自动混合精度上下文
     # autocast: 自动选择合适的精度进行计算
     # CPU模式下使用nullcontext（无操作）
-    autocast_ctx = (nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast(dtype=dtype))
+    autocast_ctx = (nullcontext() if device_type == "cpu" else torch.amp.autocast(device_type=device_type, dtype=dtype))
 
     # ========== 4. 配置wandb ==========
     # 📚 实验跟踪初始化
@@ -298,7 +306,7 @@ if __name__ == "__main__":
     # 📚 梯度缩放器
     # GradScaler: 用于float16训练的梯度缩放
     # 防止梯度下溢，提高训练稳定性
-    scaler = torch.cuda.amp.GradScaler(enabled=(args.dtype == "float16"))
+    scaler = torch.amp.GradScaler(device=device_type, enabled=(args.dtype == "float16"))
 
     # 📚 优化器配置
     # AdamW: 常用的优化器，带有权重衰减
