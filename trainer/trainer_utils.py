@@ -201,16 +201,6 @@ def init_model(
 
         model.load_state_dict(weights, strict=False)
 
-    if lora_weight != "None":
-        from model.model_lora import apply_lora, load_lora
-        apply_lora(model)   # 插入 LoRA 结构（训练和推理都需要）
-        lora_path = f"{save_dir}/{lora_weight}.pth"
-        if os.path.exists(lora_path):
-            load_lora(model, lora_path) # 加载已训练的权重（仅推理需要）
-            Logger(f"[LoRA] 已加载权重: {lora_path}")
-        else:
-            Logger(f"[LoRA] 结构已插入，从头开始训练")
-
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     Logger(f"所加载Model可训练参数：{total_params / 1e6:.3f} 百万")
 

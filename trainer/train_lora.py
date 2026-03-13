@@ -203,7 +203,7 @@ if __name__ == "__main__":
 
     # 📚 模型配置初始化
     # MokioMindConfig: 定义模型的超参数，如隐藏维度、层数、是否使用MoE
-    lm_config = MokioMindConfig(
+    lm_config = MiniMindConfig(
         hidden_size=args.hidden_size,
         num_hidden_layers=args.num_hidden_layers,
         use_moe=bool(args.use_moe),
