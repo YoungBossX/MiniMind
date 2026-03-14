@@ -70,7 +70,7 @@ def main():
         help="LoRA权重目录")
     parser.add_argument(
         "--weight",
-        default="full_sft",
+        default="pretrain",
         type=str,
         help="权重名称前缀（pretrain, full_sft, rlhf, reason, ppo_actor, grpo, spo）",
     )
@@ -113,7 +113,7 @@ def main():
     )
     parser.add_argument(
         "--temperature",
-        default=0.7,
+        default=0.8,
         type=float,
         help="生成温度，控制随机性（0-1，越大越随机）",
     )

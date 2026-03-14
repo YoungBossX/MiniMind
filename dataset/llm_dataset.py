@@ -308,8 +308,8 @@ class DPODataset(Dataset):
 
             'x_rejected': x_rejected,       # shape: (max_length - 1,)
             'y_rejected': y_rejected,       # shape: (max_length - 1,)
-            'mask_rejected': mask_rejected  # shape: (max_length - 1,)
-            'attention_mask_rejected': attention_mask_rejected, # shape: (max_length - 1,)
+            'mask_rejected': mask_rejected,  # shape: (max_length - 1,)
+            'attention_mask_rejected': attention_mask_rejected # shape: (max_length - 1,)
         }
 
     def _generate_loss_mask(self, input_ids):
