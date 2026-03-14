@@ -8,11 +8,12 @@ import warnings
 import torch
 import torch.distributed as dist
 from contextlib import nullcontext
-from torch import optim, nn
+from torch import optim
+import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from model.MiniMindModel import MiniMindConfig
-from dataset.llm_dataset import SFTDataset
+from dataset.llm_dataset import DPODataset
 from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler
 
 warnings.filterwarnings('ignore')
@@ -260,7 +261,7 @@ if __name__ == "__main__":
     # 📚 模型保存相关参数
     # save_dir: 指定LoRA权重和检查点的保存目录
     # lora_name: LoRA权重的标识符，用于区分不同任务的LoRA适配器
-    parser.add_argument("--save_dir", type=str, default="../out", help="LoRA权重保存目录")
+    parser.add_argument("--save_dir", type=str, default="../out", help="DPO权重保存目录")
     parser.add_argument("--save_weight", type=str, default="dpo", help="保存权重的前缀名")
 
     # 📚 训练设备和精度配置
@@ -359,7 +360,7 @@ if __name__ == "__main__":
     # lm_checkpoint(): 检查是否存在可用的检查点
     # 如果from_resume=1，则尝试加载之前的训练状态
     ckp_data = (
-        lm_checkpoint(lm_config, weight=args.lora_name, save_dir="../checkpoints")
+        lm_checkpoint(lm_config, weight=args.save_weight, save_dir="../checkpoints")
         if args.from_resume == 1
         else None
     )
@@ -394,7 +395,7 @@ if __name__ == "__main__":
 
         # 📚 实验名称生成
         # 包含关键参数，便于识别不同的实验配置
-        wandb_run_name = f"MiniMind-LoRA-{args.save_weight}-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LR-{args.learning_rate}"
+        wandb_run_name = f"MokioMind-DPO-Epoch-{args.epochs}-BatchSize-{args.batch_size}-LR-{args.learning_rate}"
         wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
     
     # ========== 5. 初始化策略模型和参考模型 ==========

@@ -165,7 +165,7 @@ if __name__ == "__main__":
     # use_moe: 是否使用Mixture of Experts架构，提高模型效率
     parser.add_argument("--hidden_size", type=int, default=512, help="模型隐藏层维度")
     parser.add_argument("--num_hidden_layers", type=int, default=8, help="Transformer层数")
-    parser.add_argument("--max_seq_len", type=int, default=512, help="训练的最大截断长度")
+    parser.add_argument("--max_seq_len", type=int, default=340, help="训练的最大截断长度")
     parser.add_argument("--use_moe", default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
 
     # 📚 数据和权重配置
