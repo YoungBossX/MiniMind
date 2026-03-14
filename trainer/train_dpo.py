@@ -89,14 +89,16 @@ def dpo_loss(ref_log_probs, policy_log_probs, mask, beta):
     """
     # ── Step 1：计算每条序列的有效长度 ─────────────────────────────
     # clamp_min(1e-8) 防止全 PAD 时除以 0
-    seq_lengths = mask.sum(dim=1, keepdim=True).clamp_min(1e-8)
+    # seq_lengths = mask.sum(dim=1, keepdim=True).clamp_min(1e-8)
     # seq_lengths shape: [B, 1]
  
     # ── Step 2：计算每条序列的平均 log 概率 ────────────────────────
     # mask 把 PAD 位置清零，只累加有效 token 的 log 概率，再除以有效长度
     # 结果 shape: [B]
-    ref_log_probs = (ref_log_probs * mask).sum(dim=1) / seq_lengths.squeeze()
-    policy_log_probs = (policy_log_probs * mask).sum(dim=1) / seq_lengths.squeeze()
+    # ref_log_probs = (ref_log_probs * mask).sum(dim=1) / seq_lengths.squeeze()
+    # policy_log_probs = (policy_log_probs * mask).sum(dim=1) / seq_lengths.squeeze()
+    ref_log_probs = (ref_log_probs * mask).sum(dim=1)
+    policy_log_probs = (policy_log_probs * mask).sum(dim=1)
  
     # ── Step 3：切分 chosen 和 rejected ────────────────────────────
     # batch 的前一半是 chosen，后一半是 rejected

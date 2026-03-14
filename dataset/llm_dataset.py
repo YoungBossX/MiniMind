@@ -264,13 +264,16 @@ class DPODataset(Dataset):
             chosen_prompt,
             truncation=True,
             max_length=self.max_length,
-            padding='max_length'
+            padding='max_length',
+            add_special_tokens=False  # 已经在 apply_chat_template 中添加了特殊标记，不需要 tokenizer 再添加一次
         )
         rejected_encoding = self.tokenizer(
             rejected_prompt,
             truncation=True,
             max_length=self.max_length,
-            padding='max_length'
+            padding='max_length',
+            add_special_tokens=False  # 已经在 apply_chat_template 中添加了特殊标记，不需要 tokenizer 再添加一次
+
         )
 
         # 转换为 token ID 列表，长度为 max_length
@@ -313,25 +316,22 @@ class DPODataset(Dataset):
         }
 
     def _generate_loss_mask(self, input_ids):
-        """
-        根据 <|im_start|>assistant 和 <|im_end|> 的位置标记哪些 token 应该参与损失计算。
-        返回一个和 input_ids 等长的 0/1 mask。
-        """
         loss_mask = [0] * len(input_ids)
         i = 0
         while i < len(input_ids):
-            # 匹配一个 assistant 段落开头
             if input_ids[i:i + len(self.bos_id)] == self.bos_id:
                 start = i + len(self.bos_id)
                 end = start
                 while end < len(input_ids):
-                    # 查找 assistant 的回答终止符 <|im_end|>
                     if input_ids[end:end + len(self.eos_id)] == self.eos_id:
                         break
                     end += 1
-                # 在 <|im_start|>assistant 和 <|im_end|> 之间部分启用 loss
-                for j in range(start + 1, min(end + len(self.eos_id) + 1, self.max_length)):
+
+                # 改这里：start + 1 -> start
+                # 改这里：end + len(self.eos_id) + 1 -> end + len(self.eos_id)
+                for j in range(start, min(end + len(self.eos_id), self.max_length)):
                     loss_mask[j] = 1
+
                 i = end + len(self.eos_id) if end < len(input_ids) else len(input_ids)
             else:
                 i += 1

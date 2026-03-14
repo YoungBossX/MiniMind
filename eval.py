@@ -116,7 +116,7 @@ def main():
     )
     parser.add_argument(
         "--temperature",
-        default=0.8,
+        default=0.7,
         type=float,
         help="生成温度，控制随机性（0-1，越大越随机）",
     )
