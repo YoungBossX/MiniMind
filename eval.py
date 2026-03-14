@@ -1,4 +1,4 @@
-import os
+﻿import os
 import argparse
 import warnings
 import torch
@@ -34,7 +34,7 @@ def init_model(args):
         if args.lora_weight != "None":
             from model.model_lora import apply_lora, load_lora
             lora_path = os.path.join(BASE_DIR, args.lora_dir, f"{args.lora_weight}_{args.hidden_size}{moe_suffix}.pth")
-            apply_lora(model)
+            apply_lora(model, args.lora_rank, args.lora_alpha, args.lora_target_modules)
             load_lora(model, lora_path)
             print(f"[LoRA] 已加载权重: {lora_path}")
 
@@ -68,6 +68,9 @@ def main():
         default="out\\lora", 
         type=str, 
         help="LoRA权重目录")
+    parser.add_argument("--lora_rank", type=int, default=8, help="LoRA适配器的秩（rank）")
+    parser.add_argument("--lora_alpha", type=int, default=16, help="LoRA适配器的alpha参数")
+    parser.add_argument("--lora_target_modules", default=["q_proj", "v_proj", "k_proj", "o_proj"], help="应用LoRA的模块列表")
     parser.add_argument(
         "--weight",
         default="full_sft",
@@ -113,7 +116,7 @@ def main():
     )
     parser.add_argument(
         "--temperature",
-        default=0.75,
+        default=0.8,
         type=float,
         help="生成温度，控制随机性（0-1，越大越随机）",
     )
