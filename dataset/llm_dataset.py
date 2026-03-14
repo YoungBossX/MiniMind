@@ -231,8 +231,8 @@ class DPODataset(Dataset):
         self.padding = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
 
         # 特殊标记 <|im_start|>assistant 和 <|im_end|> 的 token ids（一般是开头和结尾的边界符）
-        self.bos_id = tokenizer('<|im_start|>assistant', add_special_tokens=False).input_ids
-        self.eos_id = tokenizer('<|im_end|>', add_special_tokens=False).input_ids
+        self.bos_id = tokenizer('<|im_start|>assistant\n', add_special_tokens=False).input_ids
+        self.eos_id = tokenizer('<|im_end|>\n', add_special_tokens=False).input_ids
 
         # 加载 JSONL 格式数据：每行为一个 dict，有 chosen 和 rejected
         with open(file_path, 'r', encoding='utf-8') as f:
