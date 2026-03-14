@@ -4,31 +4,49 @@ from torch import optim, nn
 from torch.nn.init import kaiming_uniform_
 
 class LoRA(nn.Module):
-    def __init__(self, in_features, out_features, rank):
+    def __init__(self, in_features, out_features, rank=8, alpha=16):
         super().__init__()
-        self.rank = rank 
+        self.rank = rank
+        self.alpha = alpha
+        self.scaling = alpha / rank
+
         self.A = nn.Linear(in_features, rank, bias=False)
         self.B = nn.Linear(rank, out_features, bias=False)
-        # 矩阵 A 使用 Kaiming Uniform 初始化
-        kaiming_uniform_(self.A.weight, a=math.sqrt(5))
-        # 矩阵 B 全 0 初始化
+
+        self.A.weight.data.normal_(mean=0.0, std=0.02)
         self.B.weight.data.zero_()
 
     def forward(self, x):
-        return self.B(self.A(x))
+        return self.B(self.A(x)) * self.scaling
     
-def apply_lora(model, rank=8):
-    device = next(model.parameters()).device
-    for name, module in model.named_modules():
-        if (isinstance(module, nn.Linear) and module.weight.shape[0] == module.weight.shape[1]):
-            lora = LoRA(module.weight.shape[1], module.weight.shape[0], rank=rank).to(device)
-            setattr(module, "lora", lora)
-            original_forward = module.forward
+def apply_lora(model, rank, alpha, target_modules):
+    for name, module in list(model.named_modules()):
+        if not isinstance(module, nn.Linear):
+            continue
 
-            def forward_with_lora(x, layer1=original_forward, layer2=lora):
-                return layer1(x) + layer2(x)
+        module_name = name.split(".")[-1]
+        if module_name not in target_modules:
+            continue
 
-            module.forward = forward_with_lora
+        if hasattr(module, "lora"):
+            continue
+
+        lora = LoRA(
+            in_features=module.in_features,
+            out_features=module.out_features,
+            rank=rank,
+            alpha=alpha,
+        ).to(module.weight.device, dtype=module.weight.dtype)
+
+        module.lora = lora
+        original_forward = module.forward
+
+        def forward_with_lora(x, layer1=original_forward, layer2=lora):
+            return layer1(x) + layer2(x)
+
+        module.forward = forward_with_lora
+    
+    return model
 
 def load_lora(model, path):
     device = next(model.parameters()).device

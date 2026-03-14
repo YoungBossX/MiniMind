@@ -50,7 +50,7 @@ def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
 
         # scaler.unscale_(optimizer): 将放大的梯度恢复到真实值
         # 必须在梯度裁剪之前调用
-        if step % args.accumulation_steps == 0:
+        if step % args.accumulation_steps == 0 or step == iters:
             # 梯度反缩放，必须在梯度裁剪之前调用
             scaler.unscale_(optimizer)
 
@@ -99,7 +99,8 @@ def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
             # save_lora函数
             # 从模型中提取所有包含'lora'的参数并保存
             # 文件大小通常只有Full SFT的1-5%
-            save_lora(model, lora_save_path)
+            raw_model = model.module if hasattr(model, "module") else model
+            save_lora(raw_model, lora_save_path)
 
             # 完整训练状态保存
             # 保存模型、优化器、scaler、训练进度等
@@ -107,7 +108,7 @@ def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
             lm_checkpoint(
                 lm_config,
                 weight=args.lora_name,
-                model=model,
+                model=raw_model,
                 optimizer=optimizer,
                 scaler=scaler,
                 epoch=epoch,
@@ -143,6 +144,9 @@ if __name__ == "__main__":
     parser.add_argument("--learning_rate", type=float, default=1e-4, help="初始学习率")
     parser.add_argument("--epochs", type=int, default=50, help="训练轮数")
     parser.add_argument("--batch_size", type=int, default=32, help="batch size")
+    parser.add_argument("--lora_rank", type=int, default=8, help="LoRA适配器的秩（rank）")
+    parser.add_argument("--lora_alpha", type=int, default=16, help="LoRA适配器的alpha参数")
+    parser.add_argument("--lora_target_modules", default=["q_proj", "v_proj", "k_proj", "o_proj"], help="应用LoRA的模块列表")
 
     # 📚 数据加载和训练优化
     # num_workers: 数据加载的并行进程数，提高数据读取效率
@@ -167,6 +171,7 @@ if __name__ == "__main__":
     parser.add_argument("--num_hidden_layers", type=int, default=8, help="Transformer层数")
     parser.add_argument("--max_seq_len", type=int, default=340, help="训练的最大截断长度")
     parser.add_argument("--use_moe", default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
+    
 
     # 📚 数据和权重配置
     # data_path: 训练数据的文件路径，通常是JSONL格式
@@ -265,18 +270,40 @@ if __name__ == "__main__":
     # 📚 应用LoRA适配器
     # apply_lora(): 在模型中注入LoRA参数
     # 为指定的层添加A和B矩阵
-    apply_lora(model)
+    apply_lora(
+    model,
+    rank=args.lora_rank,
+    alpha=args.lora_alpha,
+    target_modules=args.lora_target_modules
+    )
 
     # 📚 参数统计
     # 计算总参数量和LoRA参数量
     # LoRA参数通常只占总参数的1-5%
+    for name, module in model.named_modules():
+        if hasattr(module, "lora"):
+            Logger(f"LoRA applied to: {name}")
+
     total_params = sum(p.numel() for p in model.parameters())
     lora_params_count = sum(
         p.numel() for name, p in model.named_parameters() if "lora" in name
     )
+
+    assert lora_params_count > 0, "LoRA没有成功挂载到任何层，请检查target_modules是否匹配模型层名"
+
     Logger(f"LLM 总参数量: {total_params / 1e6:.3f} M")
     Logger(f"LoRA 参数量: {lora_params_count / 1e6:.3f} M")
     Logger(f"LoRA 参数占比: {lora_params_count / total_params * 100:.2f}%")
+    
+    trainable_names = []
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            trainable_names.append(name)
+
+    Logger("===== Trainable Parameters =====")
+    for name in trainable_names:
+        Logger(name)
+    Logger(f"Trainable param tensors: {len(trainable_names)}")
 
     # 📚 参数冻结策略
     # 冻结非LoRA参数，只训练LoRA适配器
