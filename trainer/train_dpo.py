@@ -453,11 +453,11 @@ if __name__ == "__main__":
             batch_sampler = SkipBatchSampler(train_sampler or range(len(train_ds)), args.batch_size, start_step)
             loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True)
             Logger(f"Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始")
-            train_epoch(epoch, loader, len(loader), lora_params, start_step=start_step, wandb=wandb)
+            train_epoch(epoch, loader, len(loader) + start_step, ref_model, lm_config, start_step, wandb, args.beta)
         else:
             # 📚 默认从头开始
             # 标准数据加载器
             # DataLoader: PyTorch的数据加载器
             # shuffle: 单GPU时随机打乱，多GPU时由sampler控制
             loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=(train_sampler is None), sampler=train_sampler, num_workers=args.num_workers, pin_memory=True)
-            train_epoch(epoch, loader, len(loader), lora_params, 0, wandb)
+            train_epoch(epoch, loader, len(loader), ref_model, lm_config, 0, wandb, args.beta)
