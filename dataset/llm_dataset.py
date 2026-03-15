@@ -116,8 +116,8 @@ class SFTDataset(Dataset):
         self.tokenizer = tokenizer                  # 分词器
         self.max_length = max_length                # 最大输入长度（会进行截断或填充）
         self.samples = self.load_data(jsonl_path)   # 加载数据样本
-        self.bos_id = tokenizer('<|im_start|>assistant', add_special_tokens=False).input_ids # [1, 1078, 538, 501]， [1]是<|im_start|>这个特殊token的id，[1078, 538, 501]是assistant的分词id
-        self.eos_id = tokenizer('<|im_end|>', add_special_tokens=False).input_ids # [2]
+        self.bos_id = tokenizer('<|im_start|>assistant\n', add_special_tokens=False).input_ids # [1, 1078, 538, 501]， [1]是<|im_start|>这个特殊token的id，[1078, 538, 501]是assistant的分词id
+        self.eos_id = tokenizer('<|im_end|>\n', add_special_tokens=False).input_ids # [2]
 
     def __len__(self):
         return len(self.samples)  # 返回样本数量
@@ -176,8 +176,8 @@ class SFTDataset(Dataset):
                     if input_ids[end:end + len(self.eos_id)] == self.eos_id:
                         break
                     end += 1
-                # 为 assistant 回答部分（从 start + 1 到 end 之间）设置 loss mask
-                for j in range(start + 1, min(end + len(self.eos_id) + 1, self.max_length)):
+                # 为 assistant 回答部分（从 start 到 end 之间）设置 loss mask
+                for j in range(start, min(end + len(self.eos_id), self.max_length)):
                     loss_mask[j] = 1
                 # 跳过到下一个 segment
                 i = end + len(self.eos_id) if end < len(input_ids) else len(input_ids)
@@ -192,7 +192,7 @@ class SFTDataset(Dataset):
         prompt = self._create_chat_prompt(sample['conversations'])
 
         # 分词并截断，确保长度 <= max_length
-        input_ids = self.tokenizer(prompt).input_ids[:self.max_length]
+        input_ids = self.tokenizer(prompt, add_special_tokens=False).input_ids[:self.max_length]
 
         # 右侧填充 pad_token 直到 max_length 长度
         input_ids += [self.tokenizer.pad_token_id] * (self.max_length - len(input_ids))
@@ -205,6 +205,8 @@ class SFTDataset(Dataset):
         X = torch.tensor(input_ids[:-1], dtype=torch.long)         # 输入序列
         Y = torch.tensor(input_ids[1:], dtype=torch.long)          # 目标标签（shifted）
         loss_mask = torch.tensor(loss_mask[1:], dtype=torch.long)  # 对齐 Y 的位置（从第一个预测 token 开始）
+        label_attention_mask = torch.tensor([1 if id != self.tokenizer.pad_token_id else 0 for id in input_ids[1:]], dtype=torch.long)
+        loss_mask = loss_mask * label_attention_mask
         # 对其 X ，提供注意力机制中的掩码
         attention_mask = torch.tensor([1 if id != self.tokenizer.pad_token_id else 0 for id in input_ids[:-1]], dtype=torch.long)
 
@@ -293,11 +295,11 @@ class DPODataset(Dataset):
         # 构造训练数据：左移一位预测（即 y 是 x 的下一位）
         x_chosen = torch.tensor(chosen_input_ids[:-1], dtype=torch.long)      # shape: (max_length - 1,)
         y_chosen = torch.tensor(chosen_input_ids[1:], dtype=torch.long)       # shape: (max_length - 1,)
-        mask_chosen = torch.tensor(chosen_loss_mask[1:], dtype=torch.long)    # shape: (max_length - 1,)
+        mask_chosen = torch.tensor(chosen_loss_mask[1:], dtype=torch.long) * torch.tensor(chosen_attention_mask[1:], dtype=torch.long) # shape: (max_length - 1,)
 
         x_rejected = torch.tensor(rejected_input_ids[:-1], dtype=torch.long)  # shape: (max_length - 1,)
         y_rejected = torch.tensor(rejected_input_ids[1:], dtype=torch.long)   # shape: (max_length - 1,)
-        mask_rejected = torch.tensor(rejected_loss_mask[1:], dtype=torch.long)# shape: (max_length - 1,)
+        mask_rejected = torch.tensor(rejected_loss_mask[1:], dtype=torch.long) * torch.tensor(rejected_attention_mask[1:], dtype=torch.long) # shape: (max_length - 1,)
 
         # X = input_ids[:-1]，attention_mask 也取 [:-1]
         attention_mask_chosen = torch.tensor(chosen_attention_mask[:-1],   dtype=torch.long)
@@ -401,3 +403,15 @@ class RLAIFDataset(Dataset):
         prompt, answer = self.create_chat_prompt(sample["conversations"])
 
         return {"prompt": prompt, "answer": answer}
+
+if __name__ == "__main__":
+    from transformers import AutoTokenizer
+    tokenizer = AutoTokenizer.from_pretrained("../model")
+    print(tokenizer("\n", add_special_tokens=False).input_ids)
+    print(tokenizer.convert_ids_to_tokens(tokenizer("\n", add_special_tokens=False).input_ids))
+
+    print(tokenizer("assistant\n", add_special_tokens=False).input_ids)
+    print(tokenizer.convert_ids_to_tokens(tokenizer("assistant\n", add_special_tokens=False).input_ids))
+
+    print(tokenizer("<|im_start|>assistant\n", add_special_tokens=False).input_ids)
+    print(tokenizer.convert_ids_to_tokens(tokenizer("<|im_start|>assistant\n", add_special_tokens=False).input_ids))
