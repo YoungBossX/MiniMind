@@ -18,10 +18,7 @@ PPO (Proximal Policy Optimization) 是一种 Actor-Critic 强化学习算法.
 """
 import os
 import sys
- 
-__package__ = "trainer"
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
- 
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import argparse
 import re
 import warnings
