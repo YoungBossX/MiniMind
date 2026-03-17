@@ -268,7 +268,7 @@ def grpo_train_epoch(epoch, loader, iters, ref_model, reward_model, reward_token
         del completions, rewards, advantages, completion_mask
  
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="MiniMind GRPO (Improved)")
+    parser = argparse.ArgumentParser(description="MiniMind GRPO")
     parser.add_argument("--save_dir", type=str, default="../out")
     parser.add_argument('--save_weight', default='grpo', type=str)
     parser.add_argument("--epochs", type=int, default=1)
