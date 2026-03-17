@@ -163,7 +163,6 @@ def grpo_train_epoch(epoch, loader, iters, ref_model, reward_model, reward_token
         mean_r = grouped_rewards.mean(dim=1, keepdim=True)  # [B, 1]
         std_r = grouped_rewards.std(dim=1, keepdim=True)    # [B, 1]
  
-        # [BUG-6 fix] 退化组检测: 当一组内所有 reward 几乎相同时 std≈0
         # 此时 advantage 无意义, 应该置零 (不学习)
         degenerate_mask = (std_r < 1e-4).squeeze(1)  # [B] bool
         degenerate_ratio = degenerate_mask.float().mean().item()
@@ -174,7 +173,6 @@ def grpo_train_epoch(epoch, loader, iters, ref_model, reward_model, reward_token
         # 退化组的 advantage 置零
         advantages[degenerate_mask] = 0.0
         advantages = advantages.view(-1)  # [B*G]
-        # [BUG-5 fix] 去掉原版的全局二次标准化, 保留组内相对结构
  
         # ---- 5. Completion mask (只在有效 token 上计算 loss) ----
         is_eos = (completion_ids == tokenizer.eos_token_id)
@@ -185,12 +183,10 @@ def grpo_train_epoch(epoch, loader, iters, ref_model, reward_model, reward_token
         completion_mask = (torch.arange(R, device=args.device).unsqueeze(0) <= eos_idx.unsqueeze(1)).float()
  
         # ---- 6. KL 散度 ----
-        # [BUG-3 fix] 正确方向: KL(π || π_ref)
         log_ratio = actor_logps - ref_logps  # log(π/π_ref)
         per_token_kl = torch.exp(log_ratio) - log_ratio - 1  # ≥ 0
  
         # ---- 7. Policy loss (带 clip) ----
-        # [BUG-4 fix] 添加 PPO 风格的 clip
         # ratio = π_new / π_old, 由于 GRPO 每步只 forward 一次, ratio 通过
         # exp(logp - logp.detach()) 实现, 梯度只流过分子
         ratio = torch.exp(actor_logps - actor_logps.detach())  # [B*G, R]
@@ -199,7 +195,6 @@ def grpo_train_epoch(epoch, loader, iters, ref_model, reward_model, reward_token
         surr2 = torch.clamp(ratio, 1.0 - args.clip_epsilon, 1.0 + args.clip_epsilon) * adv
         per_token_loss = -torch.min(surr1, surr2) + args.beta * per_token_kl
  
-        # [BUG-7 fix] Entropy bonus
         with autocast_ctx:
             full_logits = model(outputs).logits[:, prompt_len:, :]  # [B*G, R, V]
         entropy_per_token = -(F.softmax(full_logits, dim=-1) * F.log_softmax(full_logits, dim=-1)).sum(dim=-1)
@@ -297,7 +292,7 @@ if __name__ == "__main__":
     parser.add_argument("--clip_epsilon", type=float, default=0.2, help="PPO 风格 clip 参数")
     parser.add_argument("--entropy_coef", type=float, default=0.01, help="Entropy bonus 系数")
     parser.add_argument("--reasoning", type=int, default=1, choices=[0, 1])
-    parser.add_argument("--reward_model_path", type=str, default="../../internlm2-1_8b-reward")
+    parser.add_argument("--reward_model_path", type=str, default="../internlm2-1_8b-reward")
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1])
     parser.add_argument("--use_wandb", action="store_true")
     parser.add_argument("--wandb_project", type=str, default="MiniMind-GRPO")
@@ -337,18 +332,16 @@ if __name__ == "__main__":
     # ========== 5. 模型 ==========
     base_weight = "reason" if args.reasoning == 1 else "full_sft"
     
-    # GRPO 只需要 2+1 个模型 (比 PPO 省一个 Critic 和 Old Actor)
-    model, tokenizer = init_model(lm_config, base_weight, device=args.device)
+    # GRPO 只需要 2+1 个模型
+    model, tokenizer = init_model(lm_config, base_weight, save_dir=args.save_dir, device=args.device)
     if args.use_compile == 1:
         model = torch.compile(model)
         Logger('torch.compile enabled')
     
-    ref_model, _ = init_model(lm_config, base_weight, device=args.device)
+    ref_model, _ = init_model(lm_config, base_weight, save_dir=args.save_dir, device=args.device)
     ref_model = ref_model.eval().requires_grad_(False)
     
-    reward_model = AutoModel.from_pretrained(
-        args.reward_model_path, torch_dtype=torch.float16, trust_remote_code=True
-    )
+    reward_model = AutoModel.from_pretrained(args.reward_model_path, torch_dtype=torch.float16, trust_remote_code=True)
     reward_model = reward_model.to(args.device).eval().requires_grad_(False)
     reward_tokenizer = AutoTokenizer.from_pretrained(args.reward_model_path, trust_remote_code=True)
  
@@ -396,8 +389,7 @@ if __name__ == "__main__":
         else:
             grpo_train_epoch(epoch, loader, len(loader), ref_model,
                              reward_model, reward_tokenizer, 0, wandb)
- 
-    # [BUG-8 fix] 最终保存
+            
     if is_main_process():
         Logger("Training finished. Saving final checkpoint...")
         model.eval()

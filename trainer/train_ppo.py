@@ -727,9 +727,7 @@ if __name__ == "__main__":
     critic_model = critic_model.to(args.device)
  
     # Reward Model (frozen)
-    reward_model = AutoModel.from_pretrained(
-        args.reward_model_path, device_map="cuda", torch_dtype=torch.float16, trust_remote_code=True
-    )
+    reward_model = AutoModel.from_pretrained(args.reward_model_path, device_map="cuda", torch_dtype=torch.float16, trust_remote_code=True)
     reward_model = reward_model.to(args.device).eval().requires_grad_(False)
     reward_tokenizer = AutoTokenizer.from_pretrained(args.reward_model_path, trust_remote_code=True)
  
