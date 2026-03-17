@@ -73,13 +73,13 @@ def main():
     parser.add_argument("--lora_target_modules", default=["q_proj", "v_proj", "k_proj", "o_proj"], help="应用LoRA的模块列表")
     parser.add_argument(
         "--weight",
-        default="full_sft",
+        default="ppo_actor",
         type=str,
-        help="权重名称前缀（pretrain, full_sft, rlhf, reason, ppo_actor, grpo, spo）",
+        help="权重名称前缀（pretrain, full_sft, dpo, rlhf, reason, ppo_actor, grpo, spo）",
     )
     parser.add_argument(
         "--lora_weight",
-        default="lora_identity",
+        default="None",
         type=str,
         help="LoRA权重名称（None表示不使用，可选：lora_identity, lora_medical）",
     )
@@ -116,7 +116,7 @@ def main():
     )
     parser.add_argument(
         "--temperature",
-        default=0.7,
+        default=0.85,
         type=float,
         help="生成温度，控制随机性（0-1，越大越随机）",
     )
