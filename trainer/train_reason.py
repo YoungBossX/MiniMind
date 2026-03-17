@@ -41,63 +41,23 @@ warnings.filterwarnings('ignore')
 # ==========================================================================
 #  序列匹配工具函数
 # ==========================================================================
-def find_subsequence_positions(sequence, pattern):
-    """
-    在 1D tensor sequence 中查找 pattern 子序列的所有出现位置.
-
-    例如:
-      sequence = [1, 2, 30, 450, 1573, 32, 5, 6]    ← 完整的 input token 序列
-      pattern  = [30, 450, 1573, 32]                  ← <think> 的 token ids
-      返回: [[2, 3, 4, 5]]                            ← 这 4 个位置构成 <think>
-
-    Args:
-        sequence: [T] 1D tensor (一条序列的 token ids)
-        pattern:  [P] 1D tensor (要匹配的标签 token ids)
-
-    Returns:
-        list[list[int]]: 每次匹配的位置列表
-    """
-    positions = []
-    seq_len = len(sequence)
-    pat_len = len(pattern)
-    if pat_len == 0 or seq_len < pat_len:
-        return positions
-
-    for i in range(seq_len - pat_len + 1):
-        if torch.equal(sequence[i:i + pat_len], pattern):
-            positions.append(list(range(i, i + pat_len)))
-
-    return positions
-
-
 def build_tag_penalty_mask(shift_labels, tag_id_seqs, penalty_weight=10.0, device='cpu'):
-    """
-    构建标签惩罚 mask: 只在完整标签序列出现的位置施加额外权重.
-
-    Args:
-        shift_labels:   [B, T] 移位后的 labels (已经是 input_ids[1:])
-        tag_id_seqs:    list[tensor], 每个元素是一个标签的完整 token id 序列
-                        例如 [tensor([30,450,1573,32]), tensor([5540,450,1573,32]), ...]
-        penalty_weight: 标签位置的 loss 权重倍数
-        device:         设备
-
-    Returns:
-        penalty_mask: [B, T] float tensor, 正常位置=1.0, 标签位置=penalty_weight
-        tag_hit_count: int, 命中的标签 token 总数 (用于日志)
-    """
     B, T = shift_labels.shape
     penalty_mask = torch.ones(B, T, device=device)
     tag_hit_count = 0
 
-    for b in range(B):
-        seq = shift_labels[b]  # [T]
-        for pattern in tag_id_seqs:
-            matches = find_subsequence_positions(seq, pattern)
-            for pos_list in matches:
-                for p in pos_list:
-                    if p < T:
-                        penalty_mask[b, p] = penalty_weight
-                        tag_hit_count += 1
+    for pattern in tag_id_seqs:
+        P = len(pattern)
+        if P > T:
+            continue
+        # unfold: 把序列展成所有长度为 P 的滑动窗口 [B, T-P+1, P]
+        windows = shift_labels.unfold(1, P, 1)
+        # 每个窗口和 pattern 比对, 全部相等 → 匹配 [B, T-P+1]
+        match_starts = (windows == pattern).all(dim=2)
+        # 把匹配起始位置扩展到整个标签的覆盖范围
+        for b_idx, s_idx in match_starts.nonzero(as_tuple=False).tolist():
+            penalty_mask[b_idx, s_idx:s_idx + P] = penalty_weight
+            tag_hit_count += P
 
     return penalty_mask, tag_hit_count
 
