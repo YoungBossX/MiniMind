@@ -125,3 +125,6 @@ clap-htsat-unfused
 # pth 文件
 *.pth
 **/*.pth
+
+# internlm2-1_8b-reward
+internlm2-1_8b-reward/

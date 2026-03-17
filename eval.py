@@ -116,12 +116,12 @@ def main():
     )
     parser.add_argument(
         "--temperature",
-        default=0.85,
+        default=0.65,
         type=float,
         help="生成温度，控制随机性（0-1，越大越随机）",
     )
     parser.add_argument(
-        "--top_p", default=0.85, type=float, help="nucleus采样阈值（0-1）"
+        "--top_p", default=0.80, type=float, help="nucleus采样阈值（0-1）"
     )
     parser.add_argument(
         "--historys",
@@ -186,7 +186,7 @@ def main():
             eos_token_id=tokenizer.eos_token_id,
             top_p=args.top_p,
             temperature=args.temperature,
-            repetition_penalty=1.0,
+            repetition_penalty=1.2,
         )
         response = tokenizer.decode(
             generated_ids[0][len(inputs["input_ids"][0]) :], skip_special_tokens=True

@@ -655,7 +655,7 @@ if __name__ == "__main__":
     # --- 其他 ---
     parser.add_argument("--reasoning", type=int, default=1, choices=[0, 1])
     parser.add_argument("--update_old_actor_freq", type=int, default=4)
-    parser.add_argument("--reward_model_path", type=str, default="../../internlm2-1_8b-reward")
+    parser.add_argument("--reward_model_path", type=str, default="../internlm2-1_8b-reward")
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1])
     parser.add_argument("--use_wandb", action="store_true")
     parser.add_argument("--wandb_project", type=str, default="MiniMind-PPO-Improved")
