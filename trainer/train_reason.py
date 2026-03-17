@@ -37,28 +37,38 @@ from trainer.trainer_utils import (
 
 warnings.filterwarnings('ignore')
 
-
 # ==========================================================================
 #  序列匹配工具函数
 # ==========================================================================
-def build_tag_penalty_mask(shift_labels, tag_id_seqs, penalty_weight=10.0, device='cpu'):
-    B, T = shift_labels.shape
+def build_tag_penalty_mask(labels, tag_id_seqs, penalty_weight=10.0, device='cpu'):
+    """
+    用 unfold 滑动窗口做序列匹配, 只惩罚完整的标签序列.
+    
+    Args:
+        labels:         [B, T] 目标 token ids (即 dataset 返回的 Y)
+        tag_id_seqs:    list[tensor], 每个是一个标签的完整 token id 序列
+        penalty_weight: 标签位置的 loss 权重倍数
+    Returns:
+        penalty_mask:   [B, T] float, 正常=1.0, 标签=penalty_weight
+        tag_hit_count:  int, 命中的标签 token 总数
+    """
+    B, T = labels.shape
     penalty_mask = torch.ones(B, T, device=device)
     tag_hit_count = 0
-
+ 
     for pattern in tag_id_seqs:
         P = len(pattern)
         if P > T:
             continue
-        # unfold: 把序列展成所有长度为 P 的滑动窗口 [B, T-P+1, P]
-        windows = shift_labels.unfold(1, P, 1)
-        # 每个窗口和 pattern 比对, 全部相等 → 匹配 [B, T-P+1]
-        match_starts = (windows == pattern).all(dim=2)
-        # 把匹配起始位置扩展到整个标签的覆盖范围
+        # unfold: [B, T-P+1, P] 每个位置取长度 P 的滑动窗口
+        windows = labels.unfold(1, P, 1)
+        # 和 pattern 逐元素比较, 全部相等 = 匹配
+        match_starts = (windows == pattern).all(dim=2)  # [B, T-P+1]
+        # 展开匹配位置
         for b_idx, s_idx in match_starts.nonzero(as_tuple=False).tolist():
             penalty_mask[b_idx, s_idx:s_idx + P] = penalty_weight
             tag_hit_count += P
-
+ 
     return penalty_mask, tag_hit_count
 
 
@@ -67,72 +77,72 @@ def build_tag_penalty_mask(shift_labels, tag_id_seqs, penalty_weight=10.0, devic
 # ==========================================================================
 def train_epoch(epoch, loader, iters, lm_config, tag_id_seqs,
                 start_step=0, wandb=None):
-    """
-    训练循环. 与普通 SFT 的区别仅在于: 对格式标签施加更高的 loss 权重.
-
-    Args:
-        tag_id_seqs: 预计算的标签 token id 序列列表 (在 main 中创建, 传进来复用)
-    """
     loss_fct = nn.CrossEntropyLoss(reduction='none')
     start_time = time.time()
-
-    for step, (input_ids, labels, loss_mask, attention_mask) in enumerate(loader, start=start_step + 1):
-        input_ids = input_ids.to(args.device)
-        labels = labels.to(args.device)
-        loss_mask = loss_mask.to(args.device)
+ 
+    for step, (X, Y, loss_mask, attention_mask) in enumerate(loader, start=start_step + 1):
+        # ────────────────────────────────────────────────────────────
+        #  你的 SFTDataset 返回 4 个值:
+        #    X              = input_ids[:-1]   [B, T]  模型输入 (已 shift)
+        #    Y              = input_ids[1:]    [B, T]  目标 token (已 shift)
+        #    loss_mask = 只在 assistant 回答部分为 1  [B, T]
+        #    attention_mask = X 的 padding mask           [B, T]
+        #
+        #  关键: X 和 Y 已经错开一位了!
+        #    model(X) → logits[t] 直接对应 Y[t], 不需要再 shift!
+        # ────────────────────────────────────────────────────────────
+        X = X.to(args.device)
+        Y = Y.to(args.device)
+        loss_mask = loss_mask.to(args.device).float()
         attention_mask = attention_mask.to(args.device)
-        # 手动调整学习率 (余弦退火)
+ 
+        # 手动余弦退火学习率
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
-
+ 
         # ---- Forward ----
         with autocast_ctx:
-            res = model(input_ids)
-            # 语言模型预测下一个 token, 所以 logits 和 labels 要错开一位
-            shift_logits = res.logits[..., :-1, :].contiguous()  # [B, T, V]
-            shift_labels = labels[..., 1:].contiguous()           # [B, T]
-
-            # 计算 per-token cross entropy loss
+            res = model(X)
+            logits = res.logits  # [B, T, V]  已经和 Y 对齐, 不需要再 shift!
+ 
+            # per-token cross entropy
             loss_raw = loss_fct(
-                shift_logits.view(-1, shift_logits.size(-1)),
-                shift_labels.view(-1)
-            ).view(shift_labels.size())  # [B, T]
-
-            # ---- 构建 loss mask ----
-            # 基础 mask: labels=-100 的位置不参与 loss (prompt 部分和 padding)
-            loss_mask = (shift_labels != -100).float()  # [B, T]
-
+                logits.view(-1, logits.size(-1)),  # [B*T, V]
+                Y.view(-1)                          # [B*T]
+            ).view(Y.size())  # [B, T]
+ 
+            # ---- 标签惩罚 mask ----
+            # 在 Y 上做序列匹配, 找到 <think>/<answer> 等完整标签
             penalty_mask, tag_hit_count = build_tag_penalty_mask(
-                shift_labels, tag_id_seqs,
+                Y, tag_id_seqs,
                 penalty_weight=args.tag_penalty_weight,
                 device=args.device
             )
-
-            # 合并: 基础 mask × 惩罚 mask
-            # 效果: prompt/pad 位置 = 0, 正常 response 位置 = 1, 标签位置 = penalty_weight
+ 
+            # 最终权重 = dataset 提供的 loss_mask × 标签惩罚
+            #   prompt/padding 位置: loss_mask=0 → 乘完=0 (不算 loss)
+            #   普通 response 位置: loss_mask=1, penalty=1 → 权重=1
+            #   标签位置:          loss_mask=1, penalty=10 → 权重=10
             weighted_mask = loss_mask * penalty_mask  # [B, T]
-
-            # 计算加权 loss
-            # 分母用未加权的 token 数, 这样标签的 penalty_weight 倍效果才能体现
+ 
+            # 分母用 loss_mask 的有效 token 数
             valid_token_count = loss_mask.sum()
             logits_loss = (loss_raw * weighted_mask).sum() / (valid_token_count + 1e-8)
-
-            # 加上 MoE 的负载均衡 loss (非 MoE 模型为 0)
+ 
             loss = logits_loss + res.aux_loss
             loss = loss / args.accumulation_steps
-
+ 
         # ---- Backward ----
         scaler.scale(loss).backward()
-
-        # ---- 梯度步 (支持梯度累积) ----
+ 
         if (step + 1) % args.accumulation_steps == 0:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad(set_to_none=True)
-
+ 
         # ---- 日志 ----
         if step % args.log_interval == 0 or step == iters - 1:
             spend_time = time.time() - start_time
@@ -141,10 +151,8 @@ def train_epoch(epoch, loader, iters, lm_config, tag_id_seqs,
             current_logits_loss = logits_loss.item()
             current_lr = optimizer.param_groups[-1]['lr']
             eta_min = spend_time / (step + 1) * iters // 60 - spend_time // 60
-
-            # 标签命中率: 每个 batch 平均命中多少个标签 token
             tag_ratio = tag_hit_count / max(valid_token_count.item(), 1)
-
+ 
             Logger(
                 f'Epoch:[{epoch + 1}/{args.epochs}]({step}/{iters}), '
                 f'loss:{current_loss:.4f}, logits:{current_logits_loss:.4f}, '
@@ -154,15 +162,12 @@ def train_epoch(epoch, loader, iters, lm_config, tag_id_seqs,
             )
             if wandb:
                 wandb.log({
-                    "loss": current_loss,
-                    "logits_loss": current_logits_loss,
-                    "aux_loss": current_aux_loss,
-                    "tag_hit_count": tag_hit_count,
-                    "tag_hit_ratio": tag_ratio,
-                    "learning_rate": current_lr,
+                    "loss": current_loss, "logits_loss": current_logits_loss,
+                    "aux_loss": current_aux_loss, "tag_hit_count": tag_hit_count,
+                    "tag_hit_ratio": tag_ratio, "learning_rate": current_lr,
                     "epoch_time": eta_min
                 })
-
+ 
         # ---- 保存 checkpoint ----
         if (step % args.save_interval == 0 or step == iters - 1) and is_main_process():
             model.eval()
@@ -179,8 +184,8 @@ def train_epoch(epoch, loader, iters, lm_config, tag_id_seqs,
             )
             model.train()
             del state_dict
-
-        del input_ids, labels, res, loss
+ 
+        del X, Y, loss_mask, attention_mask, res, loss
 
 
 # ==========================================================================
@@ -199,7 +204,7 @@ if __name__ == "__main__":
     parser.add_argument("--accumulation_steps", type=int, default=1, help="梯度累积步数")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="梯度裁剪阈值")
     parser.add_argument("--log_interval", type=int, default=100, help="日志打印间隔")
-    parser.add_argument("--save_interval", type=int, default=100, help="模型保存间隔")
+    parser.add_argument("--save_interval", type=int, default=500, help="模型保存间隔")
     parser.add_argument('--hidden_size', default=512, type=int, help="隐藏层维度")
     parser.add_argument('--num_hidden_layers', default=8, type=int, help="隐藏层数量")
     parser.add_argument('--max_seq_len', default=720, type=int, help="训练的最大截断长度 (中文 1 token ≈ 1.5~1.7 字符)")
