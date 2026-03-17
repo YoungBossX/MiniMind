@@ -624,8 +624,8 @@ if __name__ == "__main__":
     parser.add_argument('--save_weight', default='ppo_actor', type=str)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=4)
-    parser.add_argument("--learning_rate", type=float, default=5e-7, help="Actor 学习率")
-    parser.add_argument("--critic_learning_rate", type=float, default=5e-7, help="Critic 学习率")
+    parser.add_argument("--learning_rate", type=float, default=1e-6, help="Actor 学习率")
+    parser.add_argument("--critic_learning_rate", type=float, default=1e-6, help="Critic 学习率")
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--dtype", type=str, default="bfloat16")
     parser.add_argument("--num_workers", type=int, default=2)
@@ -639,7 +639,7 @@ if __name__ == "__main__":
     parser.add_argument('--num_hidden_layers', default=8, type=int)
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1])
     parser.add_argument('--max_seq_len', default=66, type=int, help="Prompt 最大长度")
-    parser.add_argument("--max_gen_len", type=int, default=1536, help="生成最大长度")
+    parser.add_argument("--max_gen_len", type=int, default=512, help="生成最大长度")
     parser.add_argument("--data_path", type=str, default="../dataset/rlaif-mini.jsonl")
  
     # --- PPO 核心超参数 ---

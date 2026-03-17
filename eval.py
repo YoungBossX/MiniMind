@@ -116,12 +116,12 @@ def main():
     )
     parser.add_argument(
         "--temperature",
-        default=0.65,
+        default=0.85,
         type=float,
         help="生成温度，控制随机性（0-1，越大越随机）",
     )
     parser.add_argument(
-        "--top_p", default=0.80, type=float, help="nucleus采样阈值（0-1）"
+        "--top_p", default=0.85, type=float, help="nucleus采样阈值（0-1）"
     )
     parser.add_argument(
         "--historys",
