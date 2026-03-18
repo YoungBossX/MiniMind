@@ -37,21 +37,14 @@ def get_per_token_logps(mdl, input_ids, num_completion_tokens):
     Returns:
         per_token_logps: [B*G, R] 每个 response token 的 log-prob
     """
-    # detach + clone 确保不影响原 tensor 的计算图
-    ids = input_ids.detach().clone() # [Batch_size * Generations, Prompt_tokens + Response_tokens]
-
-    # logits_to_keep: 只计算最后 R+1 个位置的 logits (节省显存)
-    # +1 是因为 logits[t] 预测 token[t+1], 所以需要多一个位置
+    ids = input_ids.detach().clone()
     logits = mdl(ids, logits_to_keep=num_completion_tokens + 1).logits
-    # 去掉最后一个位置 (它预测的是 response 之后的 token, 不需要)
-    logits = logits[:, :-1, :] # [Batch_size * Generations, Response_tokens, Vocab_size]
-    # 取出 completion 部分的 token ids 作为 gather 的 index
-    completion_ids = ids[:, -num_completion_tokens:]  # [Batch_size * Generations, Response_tokens]
-    # 向量化 gather: 一行搞定, 不需要 for 循环
-    log_probs = F.log_softmax(logits, dim=-1)  # [B*G, R, V]
-    per_token_logps = log_probs.gather(2, completion_ids.unsqueeze(-1)).squeeze(-1)  # [B*G, R]
-
-    return per_token_logps
+    logits = logits[:, :-1, :]
+    completion_ids = ids[:, -num_completion_tokens:]
+    log_probs = F.log_softmax(logits, dim=-1)
+    per_token_logps = log_probs.gather(2, completion_ids.unsqueeze(-1)).squeeze(-1)
+    entropy_per_token = -(log_probs.exp() * log_probs).sum(dim=-1)
+    return per_token_logps, entropy_per_token
 
 # ==========================================================================
 #  Reward 计算
@@ -146,12 +139,12 @@ def grpo_train_epoch(epoch, loader, iters, ref_model, reward_model, reward_token
  
         # ---- 3. 计算 actor 和 ref 的 per-token log-prob ----
         with autocast_ctx:
-            actor_logps = get_per_token_logps(model, outputs, R)  # [B*G, R]
+            actor_logps, entropy_per_token = get_per_token_logps(model, outputs, R)
             res = model(outputs) if lm_config.use_moe else None
             aux_loss = res.aux_loss if res is not None else torch.tensor(0.0, device=args.device)
  
         with torch.no_grad():
-            ref_logps = get_per_token_logps(ref_model, outputs, R)  # [B*G, R]
+            ref_logps, _ = get_per_token_logps(ref_model, outputs, R)  # [B*G, R]
  
         # ---- 4. 计算 reward 和 advantage ----
         completions = tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
@@ -194,10 +187,7 @@ def grpo_train_epoch(epoch, loader, iters, ref_model, reward_model, reward_token
         surr1 = ratio * adv
         surr2 = torch.clamp(ratio, 1.0 - args.clip_epsilon, 1.0 + args.clip_epsilon) * adv
         per_token_loss = -torch.min(surr1, surr2) + args.beta * per_token_kl
- 
-        with autocast_ctx:
-            full_logits = model(outputs).logits[:, prompt_len:, :]  # [B*G, R, V]
-        entropy_per_token = -(F.softmax(full_logits, dim=-1) * F.log_softmax(full_logits, dim=-1)).sum(dim=-1)
+
         entropy = (entropy_per_token * completion_mask).sum() / (completion_mask.sum() + 1e-8)
  
         # 加权平均 (每个序列除以自己的有效 token 数, 再取 batch 均值)
@@ -293,7 +283,7 @@ if __name__ == "__main__":
     parser.add_argument("--entropy_coef", type=float, default=0.01, help="Entropy bonus 系数")
     parser.add_argument("--reasoning", type=int, default=1, choices=[0, 1])
     parser.add_argument("--reward_model_path", type=str, default="../internlm2-1_8b-reward")
-    parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1])
+    parser.add_argument('--from_resume', default=1, type=int, choices=[0, 1])
     parser.add_argument("--use_wandb", action="store_true")
     parser.add_argument("--wandb_project", type=str, default="MiniMind-GRPO")
     parser.add_argument("--use_compile", default=0, type=int, choices=[0, 1])
