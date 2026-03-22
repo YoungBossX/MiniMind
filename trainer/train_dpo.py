@@ -318,7 +318,7 @@ if __name__ == "__main__":
     parser.add_argument("--data_path", type=str, default="../dataset/dpo.jsonl", help="训练数据路径")
     # DPO 基于 SFT 模型进行对齐优化，from_weight 通常是 "full_sft"
     parser.add_argument("--from_weight", default="full_sft", type=str, help="基于哪个权重训练，默认full_sft")
-    parser.add_argument("--from_resume", default=0, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
+    parser.add_argument("--from_resume", default=1, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
 
     # 📚 实验跟踪配置
     # use_wandb: 是否启用WandB/SwanLab进行实验跟踪
