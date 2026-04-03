@@ -73,7 +73,7 @@ def main():
     parser.add_argument("--lora_target_modules", default=["q_proj", "v_proj", "k_proj", "o_proj"], help="应用LoRA的模块列表")
     parser.add_argument(
         "--weight",
-        default="grpo",
+        default="dpo",
         type=str,
         help="权重名称前缀（pretrain, full_sft, dpo, rlhf, reason, ppo_actor, grpo, spo）",
     )
