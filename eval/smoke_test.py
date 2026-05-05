@@ -193,6 +193,10 @@ def smoke_lora(device, use_swanlab=False):
     model, tokenizer = init_model(config, "full_sft", device=device, save_dir=SAVE_DIR)
     apply_lora(model, rank=8, alpha=16, target_modules=["q_proj", "v_proj", "k_proj", "o_proj"])
 
+    # 冻结非 LoRA 参数，只训练 LoRA 适配器
+    for name, param in model.named_parameters():
+        param.requires_grad = "lora" in name
+
     # 检查仅 LoRA 参数可训练
     lora_params = []
     frozen_has_grad = False
