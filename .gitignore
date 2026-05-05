@@ -128,3 +128,12 @@ clap-htsat-unfused
 
 # internlm2-1_8b-reward
 internlm2-1_8b-reward/
+
+# eval reports (generated)
+eval/reports/*.json
+eval/reports/*.md
+
+# eval test_data (committed, override **/*.jsonl)
+!eval/test_data/*.jsonl
+!eval/test_data/.gitkeep
+!eval/reports/.gitkeep
