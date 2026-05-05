@@ -16,7 +16,7 @@ import numpy as np
 import torch
 
 from model.MiniMindModel import MiniMindConfig, MiniMindForCausalLM
-from eval.eval_utils import (
+from eval_utils import (
     generate_report, check_grad_flow, verify_checkpoint_roundtrip,
     init_swanlab, log_to_swanlab, make_small_config,
 )
@@ -25,6 +25,7 @@ warnings.filterwarnings("ignore")
 
 SMOKE_STEPS = 50
 REPORT_DIR = os.path.join(os.path.dirname(__file__), "reports")
+SAVE_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "out")
 
 
 def assertion(name, passed, detail=""):
@@ -125,7 +126,7 @@ def smoke_sft(device, use_swanlab=False):
     from trainer.trainer_utils import init_model
 
     config = make_small_config()
-    model, tokenizer = init_model(config, "pretrain", device=device)
+    model, tokenizer = init_model(config, "pretrain", device=device, save_dir=SAVE_DIR)
 
     data_path = os.path.join(os.path.dirname(__file__), "test_data", "sft_smoke.jsonl")
     ds = SFTDataset(data_path, tokenizer, max_length=128)
@@ -189,7 +190,7 @@ def smoke_lora(device, use_swanlab=False):
     from model.model_lora import apply_lora, save_lora
 
     config = make_small_config()
-    model, tokenizer = init_model(config, "full_sft", device=device)
+    model, tokenizer = init_model(config, "full_sft", device=device, save_dir=SAVE_DIR)
     apply_lora(model, rank=8, alpha=16, target_modules=["q_proj", "v_proj", "k_proj", "o_proj"])
 
     # 检查仅 LoRA 参数可训练
@@ -267,8 +268,8 @@ def smoke_dpo(device, use_swanlab=False):
     import torch.nn.functional as F
 
     config = make_small_config()
-    model, tokenizer = init_model(config, "full_sft", device=device)
-    ref_model, _ = init_model(config, "full_sft", device=device)
+    model, tokenizer = init_model(config, "full_sft", device=device, save_dir=SAVE_DIR)
+    ref_model, _ = init_model(config, "full_sft", device=device, save_dir=SAVE_DIR)
     ref_model.eval()
     for p in ref_model.parameters():
         p.requires_grad_(False)
@@ -358,7 +359,7 @@ def smoke_reason(device, use_swanlab=False):
     import torch.nn as nn
 
     config = make_small_config()
-    model, tokenizer = init_model(config, "dpo", device=device)
+    model, tokenizer = init_model(config, "dpo", device=device, save_dir=SAVE_DIR)
 
     # 构建标签 token 序列
     tag_id_seqs = []
@@ -449,15 +450,15 @@ def smoke_ppo(device, use_swanlab=False):
     config = make_small_config()
     base_weight = "dpo"
 
-    actor, tokenizer = init_model(config, base_weight, device=device)
+    actor, tokenizer = init_model(config, base_weight, device=device, save_dir=SAVE_DIR)
     actor.train()
 
-    old_actor, _ = init_model(config, base_weight, device=device)
+    old_actor, _ = init_model(config, base_weight, device=device, save_dir=SAVE_DIR)
     old_actor.eval()
     for p in old_actor.parameters():
         p.requires_grad_(False)
 
-    ref_model, _ = init_model(config, base_weight, device=device)
+    ref_model, _ = init_model(config, base_weight, device=device, save_dir=SAVE_DIR)
     ref_model.eval()
     for p in ref_model.parameters():
         p.requires_grad_(False)
@@ -533,7 +534,7 @@ def smoke_grpo(device, use_swanlab=False):
     from trainer.trainer_utils import init_model
 
     config = make_small_config()
-    model, tokenizer = init_model(config, "dpo", device=device)
+    model, tokenizer = init_model(config, "dpo", device=device, save_dir=SAVE_DIR)
     model.eval()
 
     # 生成 G 个回答
