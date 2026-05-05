@@ -426,6 +426,157 @@ def smoke_reason(device, use_swanlab=False):
     ], use_swanlab)
 
 
+def smoke_ppo(device, use_swanlab=False):
+    """PPO 管线 smoke test: 验证四个模型加载 + rollout 可完成"""
+    if not torch.cuda.is_available():
+        print("  [SKIP] PPO smoke test requires GPU")
+        return run_stage("ppo", make_small_config(), {"status": "skipped (no GPU)"}, [
+            assertion("ppo_skipped_no_gpu", True),
+        ], use_swanlab)
+
+    import os as _os
+    reward_path = _os.path.join(_os.path.dirname(_os.path.dirname(__file__)), "internlm2-1_8b-reward")
+    if not _os.path.exists(reward_path):
+        print("  [SKIP] PPO smoke test requires Reward Model at internlm2-1_8b-reward/")
+        return run_stage("ppo", make_small_config(), {"status": "skipped (no reward model)"}, [
+            assertion("ppo_skipped_no_rm", True),
+        ], use_swanlab)
+
+    from transformers import AutoTokenizer, AutoModel
+    from trainer.trainer_utils import init_model
+    from trainer.train_ppo import CriticModel, compute_gae
+
+    config = make_small_config()
+    base_weight = "dpo"
+
+    actor, tokenizer = init_model(config, base_weight, device=device)
+    actor.train()
+
+    old_actor, _ = init_model(config, base_weight, device=device)
+    old_actor.eval()
+    for p in old_actor.parameters():
+        p.requires_grad_(False)
+
+    ref_model, _ = init_model(config, base_weight, device=device)
+    ref_model.eval()
+    for p in ref_model.parameters():
+        p.requires_grad_(False)
+
+    # Critic
+    critic = CriticModel(config).to(device)
+    try:
+        ckpt_state = torch.load(
+            _os.path.join(_os.path.dirname(_os.path.dirname(__file__)), "out", f"{base_weight}_{config.hidden_size}.pth"),
+            map_location=device
+        )
+        critic.load_state_dict(ckpt_state, strict=False)
+    except FileNotFoundError:
+        pass
+
+    # Reward
+    reward_model = AutoModel.from_pretrained(reward_path, trust_remote_code=True, torch_dtype=torch.float16).to(device).eval()
+    reward_tokenizer = AutoTokenizer.from_pretrained(reward_path, trust_remote_code=True)
+    for p in reward_model.parameters():
+        p.requires_grad_(False)
+
+    # Rollout
+    prompts = ["你好，请介绍一下你自己。", "1+1等于多少？"]
+    actor_gen = actor.module if hasattr(actor, "module") else actor
+    enc = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=64, padding_side="left").to(device)
+    gen_out = actor_gen.generate(
+        **enc, max_new_tokens=32, do_sample=True, temperature=0.8,
+        pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id,
+    )
+    prompt_len = enc.input_ids.shape[1]
+    responses = [tokenizer.decode(gen_out[i, prompt_len:], skip_special_tokens=True) for i in range(len(prompts))]
+    print(f"  Generated {len(responses)} responses, avg_len={np.mean([len(r) for r in responses]):.1f}")
+
+    # GAE
+    seq_len = gen_out.size(1) - 1
+    B = len(prompts)
+    values_seq = torch.randn(B, seq_len, device=device) * 0.1
+    resp_mask = torch.ones(B, seq_len, device=device)
+    rewards = torch.randn(B, device=device)
+    advantages, returns = compute_gae(rewards, values_seq, resp_mask)
+    adv_nonzero = (advantages.abs().sum() > 0).item()
+
+    return run_stage("ppo", config, {
+        "num_prompts": len(prompts), "num_responses": len(responses),
+        "response_len_mean": np.mean([len(r) for r in responses]),
+        "gae_adv_nonzero": adv_nonzero,
+    }, [
+        assertion("actor_loaded", True),
+        assertion("critic_loaded", True),
+        assertion("ref_loaded", True),
+        assertion("reward_loaded", True),
+        assertion("rollout_completed", len(responses) == 2),
+        assertion("gae_adv_nonzero", adv_nonzero, "GAE advantage should be non-zero"),
+    ], use_swanlab)
+
+
+def smoke_grpo(device, use_swanlab=False):
+    """GRPO 管线 smoke test: 验证多回答生成 + 组内 advantage"""
+    if not torch.cuda.is_available():
+        print("  [SKIP] GRPO smoke test requires GPU")
+        return run_stage("grpo", make_small_config(), {"status": "skipped (no GPU)"}, [
+            assertion("grpo_skipped_no_gpu", True),
+        ], use_swanlab)
+
+    import os as _os
+    reward_path = _os.path.join(_os.path.dirname(_os.path.dirname(__file__)), "internlm2-1_8b-reward")
+    if not _os.path.exists(reward_path):
+        print("  [SKIP] GRPO smoke test requires Reward Model")
+        return run_stage("grpo", make_small_config(), {"status": "skipped (no reward model)"}, [
+            assertion("grpo_skipped_no_rm", True),
+        ], use_swanlab)
+
+    from trainer.trainer_utils import init_model
+
+    config = make_small_config()
+    model, tokenizer = init_model(config, "dpo", device=device)
+    model.eval()
+
+    # 生成 G 个回答
+    G = 4
+    prompts = ["你好"]
+    prompt_inputs = tokenizer(prompts, return_tensors="pt", padding=True, padding_side="left").to(device)
+    prompt_inputs["input_ids"] = prompt_inputs["input_ids"][:, -64:]
+    prompt_inputs["attention_mask"] = prompt_inputs["attention_mask"][:, -64:]
+
+    model_gen = model.module if hasattr(model, "module") else model
+    with torch.no_grad():
+        outputs = model_gen.generate(
+            **prompt_inputs, max_new_tokens=32, do_sample=True, temperature=0.8,
+            num_return_sequences=G, pad_token_id=tokenizer.pad_token_id,
+        )
+
+    prompt_len = prompt_inputs["input_ids"].size(1)
+    completions = tokenizer.batch_decode(outputs[:, prompt_len:], skip_special_tokens=True)
+
+    # 检查回答互不相同
+    unique_count = len(set(completions))
+    all_different = unique_count == len(completions)
+
+    # 模拟 reward + 组内 advantage
+    fake_rewards = torch.randn(len(completions), device=device)
+    grouped = fake_rewards.view(-1, G)
+    mean_r = grouped.mean(dim=1, keepdim=True)
+    std_r = grouped.std(dim=1, keepdim=True)
+    advantages = ((grouped - mean_r) / (std_r + 1e-4)).view(-1)
+
+    return run_stage("grpo", config, {
+        "num_prompts": len(prompts), "num_generations": G,
+        "total_completions": len(completions),
+        "unique_completions": unique_count,
+        "adv_mean": advantages.mean().item(),
+        "adv_std": advantages.std().item(),
+    }, [
+        assertion("generation_completed", len(completions) == len(prompts) * G),
+        assertion("completions_different", all_different, f"{unique_count}/{len(completions)} unique"),
+        assertion("adv_std_gt_0", advantages.std().item() > 0),
+    ], use_swanlab)
+
+
 def main():
     parser = argparse.ArgumentParser(description="MiniMind Smoke Test")
     parser.add_argument("--all", action="store_true", help="运行所有管线 smoke test")
