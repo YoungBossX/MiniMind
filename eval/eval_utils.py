@@ -122,7 +122,7 @@ def log_to_swanlab(stage, metrics, step=0):
     if _swanlab_run is None:
         return
     import swanlab
-    data = {f"eval/{stage}/{k}": v for k, v in metrics.items()}
+    data = {f"eval/{stage}/{k}": _to_serializable(v) for k, v in metrics.items()}
     swanlab.log(data, step=step)
 
 
@@ -158,24 +158,25 @@ def verify_checkpoint_roundtrip(model, save_path, sample_input, device="cpu"):
         else:
             orig = orig_output.detach().clone()
 
-    tmp = _os.path.join(tempfile.gettempdir(), "_eval_ckpt_test.pth")
+    fd, tmp = tempfile.mkstemp(suffix=".pth", prefix="_eval_ckpt_")
+    _os.close(fd)
     try:
-        torch.save({k: v for k, v in model.state_dict().items()}, tmp)
+        torch.save(model.state_dict(), tmp)
 
         from model.MiniMindModel import MiniMindConfig, MiniMindForCausalLM
-        reloaded = MiniMindForCausalLM(model.config)
-        reloaded.load_state_dict(torch.load(tmp, map_location=device), strict=False)
-        reloaded.to(device).eval()
+        reloaded_model = MiniMindForCausalLM(model.config)
+        reloaded_model.load_state_dict(torch.load(tmp, map_location=device), strict=True)
+        reloaded_model.to(device).eval()
 
         with torch.no_grad():
-            reloaded_output = reloaded(sample_input)
+            reloaded_output = reloaded_model(sample_input)
             if hasattr(reloaded_output, "logits"):
-                reloaded = reloaded_output.logits.detach()
+                reloaded_logits = reloaded_output.logits.detach()
             else:
-                reloaded = reloaded_output.detach()
+                reloaded_logits = reloaded_output.detach()
 
-        allclose = torch.allclose(orig.float(), reloaded.float(), rtol=1e-3, atol=1e-5)
-        max_diff = (orig.float() - reloaded.float()).abs().max().item()
+        allclose = torch.allclose(orig.float(), reloaded_logits.float(), rtol=1e-3, atol=1e-5)
+        max_diff = (orig.float() - reloaded_logits.float()).abs().max().item()
         return allclose, f"max_diff={max_diff:.2e}"
     finally:
         if _os.path.exists(tmp):
