@@ -100,3 +100,95 @@ def save_md_report(report, path):
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
     print(f"[Report] MD saved: {path}")
+
+
+_swanlab_run = None
+
+
+def init_swanlab(project="MiniMind-Eval", run_name=None):
+    """初始化 SwanLab（仅在主进程调用）"""
+    global _swanlab_run
+    try:
+        import swanlab
+        _swanlab_run = swanlab.init(project=project, name=run_name)
+        print(f"[SwanLab] Initialized: {project}")
+    except ImportError:
+        _swanlab_run = None
+        print("[SwanLab] swanlab not installed, skipping")
+
+
+def log_to_swanlab(stage, metrics, step=0):
+    """上报指标到 SwanLab，命名空间为 eval/{stage}/{metric}"""
+    if _swanlab_run is None:
+        return
+    import swanlab
+    data = {f"eval/{stage}/{k}": v for k, v in metrics.items()}
+    swanlab.log(data, step=step)
+
+
+def check_grad_flow(model):
+    """检查模型梯度：返回 {grad_norm, has_nan, has_grad}"""
+    total_norm = 0.0
+    has_nan = False
+    has_grad = False
+    for name, param in model.named_parameters():
+        if param.grad is not None:
+            has_grad = True
+            grad_norm = param.grad.data.norm(2).item()
+            total_norm += grad_norm ** 2
+            if not has_nan and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
+                has_nan = True
+    return {
+        "grad_norm": total_norm ** 0.5,
+        "has_nan": has_nan,
+        "has_grad": has_grad,
+    }
+
+
+def verify_checkpoint_roundtrip(model, save_path, sample_input, device="cpu"):
+    """保存 checkpoint → 加载 → 比较 forward 输出。返回 (allclose, detail)"""
+    import tempfile
+    import os as _os
+
+    model.eval()
+    with torch.no_grad():
+        orig_output = model(sample_input)
+        if hasattr(orig_output, "logits"):
+            orig = orig_output.logits.detach().clone()
+        else:
+            orig = orig_output.detach().clone()
+
+    tmp = _os.path.join(tempfile.gettempdir(), "_eval_ckpt_test.pth")
+    try:
+        torch.save({k: v for k, v in model.state_dict().items()}, tmp)
+
+        from model.MiniMindModel import MiniMindConfig, MiniMindForCausalLM
+        reloaded = MiniMindForCausalLM(model.config)
+        reloaded.load_state_dict(torch.load(tmp, map_location=device), strict=False)
+        reloaded.to(device).eval()
+
+        with torch.no_grad():
+            reloaded_output = reloaded(sample_input)
+            if hasattr(reloaded_output, "logits"):
+                reloaded = reloaded_output.logits.detach()
+            else:
+                reloaded = reloaded_output.detach()
+
+        allclose = torch.allclose(orig.float(), reloaded.float(), rtol=1e-3, atol=1e-5)
+        max_diff = (orig.float() - reloaded.float()).abs().max().item()
+        return allclose, f"max_diff={max_diff:.2e}"
+    finally:
+        if _os.path.exists(tmp):
+            _os.remove(tmp)
+
+
+def make_small_config(use_moe=False):
+    """创建 MiniMindConfig 最小实例用于 smoke test"""
+    from model.MiniMindModel import MiniMindConfig
+    return MiniMindConfig(
+        hidden_size=512,
+        num_hidden_layers=8,
+        use_moe=use_moe,
+        max_position_embeddings=512,
+        dropout=0.0,
+    )
