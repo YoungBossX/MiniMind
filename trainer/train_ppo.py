@@ -527,7 +527,7 @@ def ppo_train_epoch(epoch, loader, iters, old_actor_model, ref_model,
  
         # ---- Step 3: 应用梯度 ----
         # 如果使用梯度累积 (accumulation_steps > 1), 等累积够了再 step
-        if (step + 1) % args.accumulation_steps == 0:
+        if step % args.accumulation_steps == 0:
             clip_grad_norm_(actor_model.parameters(), args.grad_clip)
             clip_grad_norm_(critic_model.parameters(), args.grad_clip)
             actor_optimizer.step()

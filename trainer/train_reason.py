@@ -103,7 +103,7 @@ def train_epoch(epoch, loader, iters, lm_config, tag_id_seqs,
  
         # ---- Forward ----
         with autocast_ctx:
-            res = model(X)
+            res = model(X, attention_mask=attention_mask)
             logits = res.logits  # [B, T, V]  已经和 Y 对齐, 不需要再 shift!
  
             # per-token cross entropy
@@ -136,7 +136,7 @@ def train_epoch(epoch, loader, iters, lm_config, tag_id_seqs,
         # ---- Backward ----
         scaler.scale(loss).backward()
  
-        if (step + 1) % args.accumulation_steps == 0:
+        if step % args.accumulation_steps == 0:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             scaler.step(optimizer)
@@ -144,13 +144,14 @@ def train_epoch(epoch, loader, iters, lm_config, tag_id_seqs,
             optimizer.zero_grad(set_to_none=True)
  
         # ---- 日志 ----
-        if step % args.log_interval == 0 or step == iters - 1:
+        if step % args.log_interval == 0 or step == iters:
             spend_time = time.time() - start_time
             current_loss = loss.item() * args.accumulation_steps
             current_aux_loss = res.aux_loss.item() if res.aux_loss is not None else 0.0
             current_logits_loss = logits_loss.item()
             current_lr = optimizer.param_groups[-1]['lr']
-            eta_min = spend_time / (step + 1) * iters // 60 - spend_time // 60
+            steps_done = step - start_step
+            eta_min = spend_time / steps_done * (iters - step) // 60
             tag_ratio = tag_hit_count / max(valid_token_count.item(), 1)
  
             Logger(
@@ -169,7 +170,7 @@ def train_epoch(epoch, loader, iters, lm_config, tag_id_seqs,
                 })
  
         # ---- 保存 checkpoint ----
-        if (step % args.save_interval == 0 or step == iters - 1) and is_main_process():
+        if (step % args.save_interval == 0 or step == iters) and is_main_process():
             model.eval()
             moe_suffix = '_moe' if lm_config.use_moe else ''
             ckp = f'{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
