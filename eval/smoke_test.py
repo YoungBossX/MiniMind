@@ -66,9 +66,16 @@ def main():
 
     os.makedirs(REPORT_DIR, exist_ok=True)
 
-    stages = ["pretrain", "sft", "lora", "dpo", "reason", "ppo", "grpo"]
+    if not args.all and not args.stage:
+        parser.print_help()
+        print("\n请指定 --all 或 --stage STAGE")
+        return
+
+    all_stages = ["pretrain", "sft", "lora", "dpo", "reason", "ppo", "grpo"]
     if args.stage:
         stages = [args.stage]
+    else:
+        stages = all_stages
     if args.skip_rl:
         stages = [s for s in stages if s not in ("ppo", "grpo")]
 
