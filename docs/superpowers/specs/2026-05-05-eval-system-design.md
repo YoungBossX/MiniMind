@@ -5,7 +5,20 @@
 ## 开发环境
 
 - OS: Windows 11
-- Python 环境: Conda 虚拟环境 `pytorch_env`，PyTorch/CUDA/transformers/datasets 已就绪
+- Python 环境: Conda 虚拟环境 `pytorch_env`
+- 核心依赖:
+
+| 包 | 版本 |
+|---|------|
+| torch | 2.5.0 |
+| transformers | 4.50.3 |
+| datasets | 4.0.0 |
+| accelerate | 1.10.1 |
+| tokenizers | 0.21.1 |
+| safetensors | 0.5.3 |
+| numpy | 1.26.4 |
+| swanlab | 0.7.10 |
+
 - 所有评测脚本在 `pytorch_env` 环境下运行
 
 ## 目标
