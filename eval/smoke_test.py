@@ -51,6 +51,134 @@ def run_stage(stage_name, config, metrics, assertions, use_swanlab=False):
     return report["passed"]
 
 
+def smoke_pretrain(device, use_swanlab=False):
+    """预训练管线 smoke test: 50 步验证"""
+    from torch import optim
+    from torch.utils.data import DataLoader
+    from dataset.llm_dataset import PretrainDataset
+    from transformers import AutoTokenizer
+
+    config = make_small_config()
+    model = MiniMindForCausalLM(config).to(device)
+    tokenizer = AutoTokenizer.from_pretrained(
+        os.path.join(os.path.dirname(os.path.dirname(__file__)), "model")
+    )
+    tokenizer.pad_token = tokenizer.eos_token
+
+    data_path = os.path.join(os.path.dirname(__file__), "test_data", "pretrain_smoke.jsonl")
+    ds = PretrainDataset(data_path, tokenizer, max_length=128)
+    loader = DataLoader(ds, batch_size=8, shuffle=True)
+
+    optimizer = optim.AdamW(model.parameters(), lr=1e-3)
+
+    # 初始 forward
+    batch = next(iter(loader))
+    X, Y, loss_mask, attn_mask = [t.to(device) for t in batch]
+    res = model(X, attention_mask=attn_mask, labels=Y, loss_mask=loss_mask)
+    initial_loss = (res.loss + res.aux_loss).item()
+    print(f"  Initial loss: {initial_loss:.4f}")
+
+    # 跑 SMOKE_STEPS 步
+    losses = []
+    model.train()
+    data_iter = iter(loader)
+    for step in range(1, SMOKE_STEPS + 1):
+        try:
+            batch = next(data_iter)
+        except StopIteration:
+            data_iter = iter(loader)
+            batch = next(data_iter)
+        X, Y, loss_mask, attn_mask = [t.to(device) for t in batch]
+
+        optimizer.zero_grad()
+        res = model(X, attention_mask=attn_mask, labels=Y, loss_mask=loss_mask)
+        loss = res.loss + res.aux_loss
+        loss.backward()
+        optimizer.step()
+        losses.append(loss.item())
+
+    final_loss = losses[-1]
+    loss_drop_pct = (initial_loss - final_loss) / initial_loss * 100
+    grad_info = check_grad_flow(model)
+    ckpt_ok, ckpt_detail = verify_checkpoint_roundtrip(model, None, X[:1], device)
+
+    print(f"  Final loss: {final_loss:.4f}, Drop: {loss_drop_pct:.1f}%")
+
+    return run_stage("pretrain", config, {
+        "initial_loss": initial_loss, "final_loss": final_loss,
+        "loss_drop_pct": loss_drop_pct, "grad_norm": grad_info["grad_norm"],
+    }, [
+        assertion("model_init_ok", True),
+        assertion("grad_has_grad", grad_info["has_grad"]),
+        assertion("grad_no_nan", not grad_info["has_nan"]),
+        assertion("loss_drop_gt_10pct", loss_drop_pct > 10, f"{loss_drop_pct:.1f}% > 10%"),
+        assertion("checkpoint_roundtrip", ckpt_ok, ckpt_detail),
+    ], use_swanlab)
+
+
+def smoke_sft(device, use_swanlab=False):
+    """SFT 管线 smoke test: 加载 pretrain 权重 → 50 步验证"""
+    from torch import optim
+    from torch.utils.data import DataLoader
+    from dataset.llm_dataset import SFTDataset
+    from trainer.trainer_utils import init_model
+
+    config = make_small_config()
+    model, tokenizer = init_model(config, "pretrain", device=device)
+
+    data_path = os.path.join(os.path.dirname(__file__), "test_data", "sft_smoke.jsonl")
+    ds = SFTDataset(data_path, tokenizer, max_length=128)
+    loader = DataLoader(ds, batch_size=4, shuffle=True)
+
+    optimizer = optim.AdamW(model.parameters(), lr=1e-5)
+
+    batch = next(iter(loader))
+    X, Y, loss_mask, attn_mask = [t.to(device) for t in batch]
+    res = model(X, attention_mask=attn_mask, labels=Y, loss_mask=loss_mask)
+    initial_loss = (res.loss + res.aux_loss).item()
+    print(f"  Initial loss: {initial_loss:.4f}")
+
+    # loss_mask 验证：prompt 位置 loss_mask=0，应不贡献 loss
+    prompt_ratio = (loss_mask == 0).float().mean().item()
+    print(f"  Prompt token ratio (mask=0): {prompt_ratio:.3f}")
+
+    losses = []
+    model.train()
+    data_iter = iter(loader)
+    for step in range(1, SMOKE_STEPS + 1):
+        try:
+            batch = next(data_iter)
+        except StopIteration:
+            data_iter = iter(loader)
+            batch = next(data_iter)
+        X, Y, loss_mask, attn_mask = [t.to(device) for t in batch]
+
+        optimizer.zero_grad()
+        res = model(X, attention_mask=attn_mask, labels=Y, loss_mask=loss_mask)
+        loss = res.loss + res.aux_loss
+        loss.backward()
+        optimizer.step()
+        losses.append(loss.item())
+
+    final_loss = losses[-1]
+    loss_drop_pct = (initial_loss - final_loss) / initial_loss * 100
+    grad_info = check_grad_flow(model)
+    ckpt_ok, ckpt_detail = verify_checkpoint_roundtrip(model, None, X[:1], device)
+
+    return run_stage("sft", config, {
+        "initial_loss": initial_loss, "final_loss": final_loss,
+        "loss_drop_pct": loss_drop_pct, "grad_norm": grad_info["grad_norm"],
+        "prompt_ratio": prompt_ratio,
+    }, [
+        assertion("model_init_ok", True),
+        assertion("grad_has_grad", grad_info["has_grad"]),
+        assertion("grad_no_nan", not grad_info["has_nan"]),
+        assertion("loss_drop_gt_10pct", loss_drop_pct > 10, f"{loss_drop_pct:.1f}% > 10%"),
+        assertion("checkpoint_roundtrip", ckpt_ok, ckpt_detail),
+        assertion("loss_mask_active", prompt_ratio > 0, f"prompt_ratio={prompt_ratio:.3f} > 0"),
+    ], use_swanlab)
+
+
 def main():
     parser = argparse.ArgumentParser(description="MiniMind Smoke Test")
     parser.add_argument("--all", action="store_true", help="运行所有管线 smoke test")
