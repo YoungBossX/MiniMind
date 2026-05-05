@@ -349,6 +349,83 @@ def smoke_dpo(device, use_swanlab=False):
     ], use_swanlab)
 
 
+def smoke_reason(device, use_swanlab=False):
+    """Reason 管线 smoke test: 加载 dpo 权重 → 格式标签惩罚训练 → 验证 tag_hit"""
+    from torch import optim
+    from torch.utils.data import DataLoader
+    from dataset.llm_dataset import SFTDataset
+    from trainer.trainer_utils import init_model
+    import torch.nn as nn
+
+    config = make_small_config()
+    model, tokenizer = init_model(config, "dpo", device=device)
+
+    # 构建标签 token 序列
+    tag_id_seqs = []
+    for tag in ["<think>", "</think>", "<answer>", "</answer>"]:
+        ids = tokenizer(tag, add_special_tokens=False).input_ids
+        tag_id_seqs.append(torch.tensor(ids, dtype=torch.long, device=device))
+
+    data_path = os.path.join(os.path.dirname(__file__), "test_data", "reason_smoke.jsonl")
+    ds = SFTDataset(data_path, tokenizer, max_length=256)
+    loader = DataLoader(ds, batch_size=4, shuffle=True)
+
+    optimizer = optim.AdamW(model.parameters(), lr=1e-6)
+    loss_fct = nn.CrossEntropyLoss(reduction="none")
+
+    batch = next(iter(loader))
+    X, Y, loss_mask, attn_mask = [t.to(device) for t in batch]
+
+    # 检查首条数据的标签命中情况
+    from trainer.train_reason import build_tag_penalty_mask
+    _, initial_hits = build_tag_penalty_mask(Y, tag_id_seqs, penalty_weight=10.0, device=device)
+    print(f"  Initial tag hits: {initial_hits}")
+
+    losses = []
+    model.train()
+    for step in range(1, SMOKE_STEPS + 1):
+        try:
+            batch = next(iter(loader))
+        except StopIteration:
+            break
+        X, Y, loss_mask, attn_mask = [t.to(device) for t in batch]
+
+        res = model(X, attention_mask=attn_mask)
+        logits = res.logits
+        loss_raw = loss_fct(logits.view(-1, logits.size(-1)), Y.view(-1)).view(Y.size())
+
+        penalty_mask, tag_hit_count = build_tag_penalty_mask(
+            Y, tag_id_seqs, penalty_weight=10.0, device=device
+        )
+        weighted_mask = loss_mask.float() * penalty_mask
+        valid_count = loss_mask.sum()
+        logits_loss = (loss_raw * weighted_mask).sum() / (valid_count + 1e-8)
+        loss = logits_loss + res.aux_loss
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+        losses.append(loss.item())
+
+    final_loss = np.mean(losses[-5:]) if len(losses) >= 5 else losses[-1]
+    final_tag_hit = tag_hit_count
+    tag_ratio = final_tag_hit / max(valid_count.item(), 1)
+    grad_info = check_grad_flow(model)
+    ckpt_ok, ckpt_detail = verify_checkpoint_roundtrip(model, None, X[:1], device)
+
+    return run_stage("reason", config, {
+        "initial_tag_hits": initial_hits, "final_tag_hits": final_tag_hit,
+        "tag_ratio": tag_ratio, "final_loss": final_loss,
+        "grad_norm": grad_info["grad_norm"],
+    }, [
+        assertion("model_init_ok", True),
+        assertion("grad_has_grad", grad_info["has_grad"]),
+        assertion("grad_no_nan", not grad_info["has_nan"]),
+        assertion("tag_hits_gt_0", final_tag_hit > 0, f"tag_hits={final_tag_hit} > 0"),
+        assertion("tag_ratio_gt_0", tag_ratio > 0, f"tag_ratio={tag_ratio:.4f} > 0"),
+        assertion("checkpoint_roundtrip", ckpt_ok, ckpt_detail),
+    ], use_swanlab)
+
+
 def main():
     parser = argparse.ArgumentParser(description="MiniMind Smoke Test")
     parser.add_argument("--all", action="store_true", help="运行所有管线 smoke test")
