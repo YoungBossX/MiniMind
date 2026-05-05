@@ -4,11 +4,12 @@ import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import json
-import time
 import subprocess
 from datetime import datetime, timezone
 import torch
 import numpy as np
+
+_PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def get_git_commit():
@@ -16,25 +17,38 @@ def get_git_commit():
     try:
         result = subprocess.run(
             ["git", "rev-parse", "--short", "HEAD"],
-            capture_output=True, text=True, cwd=os.path.dirname(os.path.dirname(__file__))
+            capture_output=True, text=True, cwd=_PROJECT_ROOT
         )
         return result.stdout.strip() if result.returncode == 0 else "unknown"
     except Exception:
         return "unknown"
 
 
+def _to_serializable(v):
+    """安全转换 metric 值为可序列化类型"""
+    if isinstance(v, torch.Tensor):
+        v = v.detach().cpu()
+        if v.numel() == 1:
+            return v.item()
+        return v.tolist()
+    if hasattr(v, "item"):
+        return v.item()
+    return v
+
+
 def generate_report(stage, metrics, assertions, output_dir):
     """生成并保存 JSON + MD 报告，返回结果字典"""
+    os.makedirs(output_dir, exist_ok=True)
     timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
     commit = get_git_commit()
-    passed = all(a["passed"] for a in assertions)
+    passed = all(a.get("passed", False) for a in assertions)
 
     report = {
         "stage": stage,
         "timestamp": timestamp,
         "git_commit": commit,
         "passed": passed,
-        "metrics": {k: (v.item() if isinstance(v, torch.Tensor) else v) for k, v in metrics.items()},
+        "metrics": {k: _to_serializable(v) for k, v in metrics.items()},
         "assertions": assertions,
     }
 
@@ -46,12 +60,14 @@ def generate_report(stage, metrics, assertions, output_dir):
 
 
 def save_json_report(report, path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2, default=str)
     print(f"[Report] JSON saved: {path}")
 
 
 def save_md_report(report, path):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
     lines = [
         f"# MiniMind Eval — {report['stage']}",
         "",
@@ -78,8 +94,8 @@ def save_md_report(report, path):
         "|-----------|--------|--------|",
     ]
     for a in report["assertions"]:
-        icon = "PASS" if a["passed"] else "FAIL"
-        lines.append(f"| {a['name']} | {icon} | {a.get('detail', '')} |")
+        icon = "PASS" if a.get("passed", False) else "FAIL"
+        lines.append(f"| {a.get('name', '?')} | {icon} | {a.get('detail', '')} |")
 
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines))
