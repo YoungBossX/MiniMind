@@ -2,6 +2,12 @@
 
 日期：2026-05-05
 
+## 开发环境
+
+- OS: Windows 11
+- Python 环境: Conda 虚拟环境 `pytorch_env`，PyTorch/CUDA/transformers/datasets 已就绪
+- 所有评测脚本在 `pytorch_env` 环境下运行
+
 ## 目标
 
 构建闭环评测系统，覆盖两个层面：
