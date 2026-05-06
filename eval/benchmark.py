@@ -91,24 +91,29 @@ def evaluate_generation_quality(model, tokenizer, prompts, max_new_tokens=256, d
         response_ids = gen[0][inputs["input_ids"].shape[1]:]
         response = tokenizer.decode(response_ids, skip_special_tokens=True)
 
-        # 重复 n-gram 比例 (rep-4)
-        tokens = response
+        # 重复 n-gram 比例 (rep-4, character-level on decoded text)
+        ids_list = response_ids.tolist()
         rep_4_count = 0
-        for i in range(len(tokens) - 7):
-            if tokens[i:i+4] == tokens[i+4:i+8]:
+        text_len = len(response)
+        for i in range(text_len - 7):
+            if response[i:i+4] == response[i+4:i+8]:
                 rep_4_count += 1
                 break
 
+        has_eos = tokenizer.eos_token_id in ids_list
+
         results.append({
             "prompt": prompt[:50],
-            "response_len": len(response),
-            "has_eos": "<|im_end|>" in response,
+            "response_len": text_len,
+            "gen_tokens": len(ids_list),
+            "has_eos": has_eos,
             "is_empty": len(response.strip()) == 0,
             "has_rep_4": rep_4_count > 0,
         })
 
     metrics = {
         "avg_response_len": np.mean([r["response_len"] for r in results]),
+        "avg_gen_tokens": np.mean([r["gen_tokens"] for r in results]),
         "eos_rate": np.mean([r["has_eos"] for r in results]),
         "empty_rate": np.mean([r["is_empty"] for r in results]),
         "rep4_rate": np.mean([r["has_rep_4"] for r in results]),
@@ -129,7 +134,8 @@ def evaluate_reasoning_format(model, tokenizer, device):
     for p in prompts:
         messages_list.append([{"role": "user", "content": p}])
 
-    results = {"total": 0, "has_think": 0, "has_answer": 0, "tag_complete": 0, "tag_valid_structure": 0}
+    results = {"total": 0, "has_think": 0, "has_answer": 0, "tag_complete": 0,
+               "tag_valid_structure": 0, "has_eos": 0}
 
     model.eval()
     for messages in messages_list:
@@ -142,8 +148,12 @@ def evaluate_reasoning_format(model, tokenizer, device):
                 pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id,
             )
 
-        response = tokenizer.decode(gen[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True)
+        gen_ids = gen[0][inputs["input_ids"].shape[1]:]
+        response = tokenizer.decode(gen_ids, skip_special_tokens=True)
         results["total"] += 1
+
+        if tokenizer.eos_token_id in gen_ids.tolist():
+            results["has_eos"] += 1
 
         has_think = "<think>" in response and "</think>" in response
         has_answer = "<answer>" in response and "</answer>" in response
