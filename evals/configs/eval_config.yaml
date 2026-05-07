@@ -1,0 +1,28 @@
+model:
+  checkpoint_path: ""
+  tokenizer_path: ""
+  hidden_size: 512
+  num_hidden_layers: 8
+  use_moe: false
+  device: "auto"
+  dtype: "auto"
+  seed: 42
+  lora_path: ""
+
+data:
+  lm_eval_path: "evals/data/lm_eval_sample.txt"
+  qa_eval_path: "evals/data/qa_eval_sample.jsonl"
+  generation_eval_path: "evals/data/generation_eval_sample.jsonl"
+
+generation:
+  max_new_tokens: 256
+  temperature: 0.7
+  top_p: 0.9
+  do_sample: false
+
+eval:
+  batch_size: 4
+  max_length: 512
+  warmup_runs: 3
+  repeat_runs: 10
+  output_dir: "outputs/evals"
