@@ -1,4 +1,4 @@
-# MiniMind
+# CC_Handmaking_LLM
 
 从零实现的轻量级语言模型训练框架，纯 PyTorch，不依赖 transformers 模型类。
 
