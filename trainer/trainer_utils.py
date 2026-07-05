@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import torch.distributed as dist
 from torch.utils.data import Sampler
+from trainer.path_utils import CHECKPOINT_DIR, project_path
 
 # 检查是否是主进程
 def is_main_process():
@@ -18,9 +19,15 @@ def Logger(content):
 
 # 动态学习率计算
 def get_lr(current_step, total_steps, lr):
-    return (
-        lr * (0.1 + 0.45 * (1 + math.cos(math.pi * current_step / total_steps)))
-    )
+    total_steps = max(int(total_steps), 1)
+    current_step = min(max(int(current_step), 0), total_steps)
+    warmup_steps = max(int(total_steps * 0.1), 1)
+
+    if current_step < warmup_steps:
+        return lr * current_step / warmup_steps
+
+    progress = (current_step - warmup_steps) / max(total_steps - warmup_steps, 1)
+    return lr * (0.1 + 0.45 * (1 + math.cos(math.pi * progress)))
 
 # 初始化分布式
 def init_distributed_mode():
@@ -56,6 +63,10 @@ def lm_checkpoint(
     save_dir=None,
     **kwargs,
 ):
+    if save_dir is None:
+        save_dir = str(CHECKPOINT_DIR)
+    else:
+        save_dir = project_path(save_dir)
     # 确保保存目录存在，不存在则创建
     os.makedirs(save_dir, exist_ok=True)
     # 构建文件名后缀：MoE 模型加 "_moe"，普通模型不加
@@ -172,7 +183,7 @@ def init_model(
     from_weight=None,
     tokenizer_path=None,
     lora_weight="None", 
-    save_dir="../out",
+    save_dir=None,
     device="cuda",
 ):
     from transformers import AutoTokenizer
@@ -186,6 +197,7 @@ def init_model(
         tokenizer_path = os.path.join(project_root, "model")
 
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+    save_dir = project_path("out" if save_dir is None else save_dir)
 
     model = MiniMindForCausalLM(lm_config)
 

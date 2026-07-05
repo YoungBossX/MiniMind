@@ -264,7 +264,7 @@ def smoke_lora(device, use_swanlab=False):
 
 
 def smoke_dpo(device, use_swanlab=False):
-    """DPO 管线 smoke test: 加载 full_sft → 训练 → 验证 chosen > rejected"""
+    """DPO 管线 smoke test: 加载 full_sft → 训练 → 验证 DPO margin"""
     from torch import optim
     from torch.utils.data import DataLoader
     from dataset.llm_dataset import DPODataset
@@ -317,11 +317,15 @@ def smoke_dpo(device, use_swanlab=False):
         out = model(x, attention_mask=attn)
         policy_logp = F.log_softmax(out.logits, dim=-1).gather(2, y.unsqueeze(-1)).squeeze(-1)
 
-        B = policy_logp.shape[0]
-        chosen_policy = (policy_logp[:B//2] * mask[:B//2]).sum(dim=1)
-        reject_policy = (policy_logp[B//2:] * mask[B//2:]).sum(dim=1)
-        chosen_ref = (ref_logp[:B//2] * mask[:B//2]).sum(dim=1)
-        reject_ref = (ref_logp[B//2:] * mask[B//2:]).sum(dim=1)
+        seq_lengths = mask.sum(dim=1).clamp_min(1e-8)
+        policy_seq_logp = (policy_logp * mask).sum(dim=1) / seq_lengths
+        ref_seq_logp = (ref_logp * mask).sum(dim=1) / seq_lengths
+
+        B = policy_seq_logp.shape[0]
+        chosen_policy = policy_seq_logp[:B//2]
+        reject_policy = policy_seq_logp[B//2:]
+        chosen_ref = ref_seq_logp[:B//2]
+        reject_ref = ref_seq_logp[B//2:]
 
         pi_logratios = chosen_policy - reject_policy
         ref_logratios = chosen_ref - reject_ref
@@ -337,19 +341,21 @@ def smoke_dpo(device, use_swanlab=False):
     grad_info = check_grad_flow(model)
     ckpt_ok, ckpt_detail = verify_checkpoint_roundtrip(model, None, x_c[:1], device)
 
-    chosen_gt_rejected = (chosen_policy.mean() > reject_policy.mean()).item()
+    dpo_margin = (pi_logratios - ref_logratios).mean().item()
+    dpo_margin_gt_0 = dpo_margin > 0
 
     return run_stage("dpo", config, {
         "final_loss": final_loss, "step_count": len(losses),
         "grad_norm": grad_info["grad_norm"],
         "chosen_logp_mean": chosen_policy.mean().item(),
         "rejected_logp_mean": reject_policy.mean().item(),
+        "dpo_margin_mean": dpo_margin,
     }, [
         assertion("model_init_ok", True),
         assertion("grad_has_grad", grad_info["has_grad"]),
         assertion("grad_no_nan", not grad_info["has_nan"]),
         assertion("dpo_loss_lt_ln2", final_loss < np.log(2), f"{final_loss:.4f} < {np.log(2):.4f}"),
-        assertion("chosen_gt_rejected", chosen_gt_rejected, "chosen logp > rejected logp"),
+        assertion("dpo_margin_gt_0", dpo_margin_gt_0, f"margin={dpo_margin:.4f} > 0"),
         assertion("checkpoint_roundtrip", ckpt_ok, ckpt_detail),
     ], use_swanlab)
 
@@ -457,11 +463,6 @@ def smoke_ppo(device, use_swanlab=False):
     actor, tokenizer = init_model(config, base_weight, device=device, save_dir=SAVE_DIR)
     actor.train()
 
-    old_actor, _ = init_model(config, base_weight, device=device, save_dir=SAVE_DIR)
-    old_actor.eval()
-    for p in old_actor.parameters():
-        p.requires_grad_(False)
-
     ref_model, _ = init_model(config, base_weight, device=device, save_dir=SAVE_DIR)
     ref_model.eval()
     for p in ref_model.parameters():
@@ -487,7 +488,15 @@ def smoke_ppo(device, use_swanlab=False):
     # Rollout
     prompts = ["你好，请介绍一下你自己。", "1+1等于多少？"]
     actor_gen = actor.module if hasattr(actor, "module") else actor
-    enc = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True, max_length=64, padding_side="left").to(device)
+    enc = tokenizer(
+        prompts,
+        return_tensors="pt",
+        padding=True,
+        truncation=True,
+        max_length=64,
+        padding_side="left",
+        return_token_type_ids=False,
+    ).to(device)
     gen_out = actor_gen.generate(
         **enc, max_new_tokens=32, do_sample=True, temperature=0.8,
         pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id,
@@ -544,7 +553,13 @@ def smoke_grpo(device, use_swanlab=False):
     # 生成 G 个回答
     G = 4
     prompts = ["你好"]
-    prompt_inputs = tokenizer(prompts, return_tensors="pt", padding=True, padding_side="left").to(device)
+    prompt_inputs = tokenizer(
+        prompts,
+        return_tensors="pt",
+        padding=True,
+        padding_side="left",
+        return_token_type_ids=False,
+    ).to(device)
     prompt_inputs["input_ids"] = prompt_inputs["input_ids"][:, -64:]
     prompt_inputs["attention_mask"] = prompt_inputs["attention_mask"][:, -64:]
 

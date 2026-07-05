@@ -34,6 +34,7 @@ from trainer.trainer_utils import (
     get_lr, Logger, is_main_process, lm_checkpoint,
     init_distributed_mode, setup_seed, init_model, SkipBatchSampler
 )
+from trainer.path_utils import resolve_project_paths
 
 warnings.filterwarnings('ignore')
 
@@ -136,7 +137,7 @@ def train_epoch(epoch, loader, iters, lm_config, tag_id_seqs,
         # ---- Backward ----
         scaler.scale(loss).backward()
  
-        if step % args.accumulation_steps == 0:
+        if step % args.accumulation_steps == 0 or step == iters:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             scaler.step(optimizer)
@@ -181,7 +182,7 @@ def train_epoch(epoch, loader, iters, lm_config, tag_id_seqs,
             lm_checkpoint(
                 lm_config, weight=args.save_weight, model=model,
                 optimizer=optimizer, scaler=scaler, epoch=epoch, step=step,
-                wandb=wandb, save_dir='../checkpoints'
+                wandb=wandb, save_dir='checkpoints'
             )
             model.train()
             del state_dict
@@ -194,7 +195,7 @@ def train_epoch(epoch, loader, iters, lm_config, tag_id_seqs,
 # ==========================================================================
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MiniMind Reasoning Distillation (Improved)")
-    parser.add_argument("--save_dir", type=str, default="../out", help="模型保存目录")
+    parser.add_argument("--save_dir", type=str, default="out", help="模型保存目录")
     parser.add_argument('--save_weight', default='reason', type=str, help="保存权重的前缀名")
     parser.add_argument("--epochs", type=int, default=1, help="训练轮数")
     parser.add_argument("--batch_size", type=int, default=8, help="batch size")
@@ -210,7 +211,7 @@ if __name__ == "__main__":
     parser.add_argument('--num_hidden_layers', default=8, type=int, help="隐藏层数量")
     parser.add_argument('--max_seq_len', default=720, type=int, help="训练的最大截断长度 (中文 1 token ≈ 1.5~1.7 字符)")
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1])
-    parser.add_argument("--data_path", type=str, default="../dataset/r1_mix_1024.jsonl", help="推理蒸馏数据路径")
+    parser.add_argument("--data_path", type=str, default="dataset/r1_mix_1024.jsonl", help="推理蒸馏数据路径")
     parser.add_argument('--from_weight', default='dpo', type=str, help="基于哪个权重训练 (默认 dpo, 即 pretrain→sft→dpo 之后)")
     parser.add_argument('--tag_penalty_weight', default=10.0, type=float, help="格式标签的 loss 惩罚倍数 (默认 10, 越大越强迫模型输出正确格式)")
     parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1])
@@ -218,6 +219,7 @@ if __name__ == "__main__":
     parser.add_argument("--wandb_project", type=str, default="MiniMind-Reasoning")
     parser.add_argument("--use_compile", default=0, type=int, choices=[0, 1])
     args = parser.parse_args()
+    args = resolve_project_paths(args, "save_dir", "data_path")
 
     # ========== 1. 初始化 ==========
     local_rank = init_distributed_mode()
@@ -232,7 +234,7 @@ if __name__ == "__main__":
         num_hidden_layers=args.num_hidden_layers,
         use_moe=bool(args.use_moe)
     )
-    ckp_data = (lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints')
+    ckp_data = (lm_checkpoint(lm_config, weight=args.save_weight, save_dir='checkpoints')
                 if args.from_resume == 1 else None)
 
     # ========== 3. 混合精度 ==========
@@ -250,7 +252,7 @@ if __name__ == "__main__":
         wandb.init(project=args.wandb_project, name=wandb_run_name, id=wandb_id, resume=resume)
 
     # ========== 5. 模型、数据、优化器 ==========
-    model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
+    model, tokenizer = init_model(lm_config, args.from_weight, save_dir=args.save_dir, device=args.device)
     if args.use_compile == 1:
         model = torch.compile(model)
         Logger('torch.compile enabled')
@@ -312,7 +314,7 @@ if __name__ == "__main__":
         lm_checkpoint(
             lm_config, weight=args.save_weight, model=model,
             optimizer=optimizer, scaler=scaler, epoch=args.epochs, step=0,
-            wandb=wandb, save_dir='../checkpoints'
+            wandb=wandb, save_dir='checkpoints'
         )
         Logger(f"Final model saved to {ckp}")
 

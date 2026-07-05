@@ -14,6 +14,7 @@ from model.MiniMindModel import MiniMindConfig
 from model.model_lora import save_lora, apply_lora
 from dataset.llm_dataset import SFTDataset
 from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler
+from trainer.path_utils import resolve_project_paths
 
 warnings.filterwarnings('ignore')
 
@@ -114,7 +115,7 @@ def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
                 epoch=epoch,
                 step=step,
                 wandb=wandb,
-                save_dir="../checkpoints",
+                save_dir="checkpoints",
             )
 
             model.train()
@@ -128,7 +129,7 @@ if __name__ == "__main__":
     # 📚 模型保存相关参数
     # save_dir: 指定LoRA权重和检查点的保存目录
     # lora_name: LoRA权重的标识符，用于区分不同任务的LoRA适配器
-    parser.add_argument("--save_dir", type=str, default="../out/lora", help="LoRA权重保存目录")
+    parser.add_argument("--save_dir", type=str, default="out/lora", help="LoRA权重保存目录")
     parser.add_argument("--lora_name", type=str, default="lora_identity", help="LoRA权重名称标识")
 
     # 📚 训练设备和精度配置
@@ -177,7 +178,7 @@ if __name__ == "__main__":
     # data_path: 训练数据的文件路径，通常是JSONL格式
     # from_weight: 基于哪个预训练权重进行LoRA微调
     # from_resume: 是否从检查点恢复训练，支持断点续训
-    parser.add_argument("--data_path", type=str, default="../dataset/lora_identity.jsonl", help="训练数据路径")
+    parser.add_argument("--data_path", type=str, default="dataset/lora_identity.jsonl", help="训练数据路径")
     parser.add_argument("--from_weight", default="full_sft", type=str, help="基于哪个权重训练，默认full_sft")
     parser.add_argument("--from_resume", default=0, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
 
@@ -188,6 +189,7 @@ if __name__ == "__main__":
     parser.add_argument("--wandb_project", type=str, default="MiniMind-LoRA", help="wandb项目名")
 
     args = parser.parse_args()
+    args = resolve_project_paths(args, "save_dir", "data_path")
 
     # ========== 1. 初始化环境和随机种子 ==========
     # 📚 分布式训练初始化
@@ -223,7 +225,7 @@ if __name__ == "__main__":
     # lm_checkpoint(): 检查是否存在可用的检查点
     # 如果from_resume=1，则尝试加载之前的训练状态
     ckp_data = (
-        lm_checkpoint(lm_config, weight=args.lora_name, save_dir="../checkpoints")
+        lm_checkpoint(lm_config, weight=args.lora_name, save_dir="checkpoints")
         if args.from_resume == 1
         else None
     )
@@ -265,7 +267,8 @@ if __name__ == "__main__":
     # 📚 模型初始化
     # init_model(): 加载预训练模型和tokenizer
     # from_weight指定基础权重文件
-    model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
+    base_save_dir = os.path.dirname(args.save_dir) if os.path.basename(args.save_dir) == "lora" else args.save_dir
+    model, tokenizer = init_model(lm_config, args.from_weight, save_dir=base_save_dir, device=args.device)
 
     # 📚 应用LoRA适配器
     # apply_lora(): 在模型中注入LoRA参数

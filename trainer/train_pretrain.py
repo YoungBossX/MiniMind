@@ -38,6 +38,7 @@ from trainer.trainer_utils import (
     init_model,
     SkipBatchSampler,
 )
+from trainer.path_utils import resolve_project_paths
 
 # 忽略警告信息，保持输出清洁
 warnings.filterwarnings("ignore")
@@ -105,7 +106,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
         scaler.scale(loss).backward()
 
         # ── 参数更新（每 accumulation_steps 步执行一次）───────────────
-        if step % args.accumulation_steps == 0:
+        if step % args.accumulation_steps == 0 or step == iters:
             # unscale_：将梯度除回缩放因子，还原真实梯度值
             # 必须在 clip_grad_norm_ 之前调用，否则裁剪的是放大后的梯度
             scaler.unscale_(optimizer)
@@ -188,7 +189,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
                 epoch=epoch,
                 step=step,
                 wandb=wandb,
-                save_dir="../checkpoints",
+                save_dir="checkpoints",
             )
 
             model.train()
@@ -197,7 +198,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MiniMind Pretraining")
 
     # ========== 基础训练参数 ==========
-    parser.add_argument("--save_dir", type=str, default="../out", help="模型保存目录")
+    parser.add_argument("--save_dir", type=str, default="out", help="模型保存目录")
     parser.add_argument("--save_weight", default="pretrain", type=str, help="保存权重的前缀名")
     parser.add_argument("--epochs", type=int, default=1, help="训练轮数（建议1轮zero或2-6轮充分训练）")
     parser.add_argument("--batch_size", type=int, default=32, help="batch size")
@@ -221,7 +222,7 @@ if __name__ == "__main__":
     parser.add_argument("--use_moe", default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
 
     # ========== 数据和恢复参数 ==========
-    parser.add_argument("--data_path", type=str, default="../dataset/pretrain_hq.jsonl", help="预训练数据路径",)
+    parser.add_argument("--data_path", type=str, default="dataset/pretrain_hq.jsonl", help="预训练数据路径",)
     parser.add_argument("--from_weight", default="none", type=str, help="基于哪个权重训练，为none则从头开始")
     parser.add_argument("--from_resume", default=1, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
 
@@ -231,6 +232,7 @@ if __name__ == "__main__":
 
     # 解析命令行参数
     args = parser.parse_args()
+    args = resolve_project_paths(args, "save_dir", "data_path")
 
     # ========== 1. 初始化环境和随机种子 ==========
     """
@@ -268,7 +270,7 @@ if __name__ == "__main__":
     # 如果开启了断点续训，尝试加载之前的训练状态
     ckp_data = (
         lm_checkpoint(
-            lm_config, weight=args.save_weight, save_dir="../checkpoints"
+            lm_config, weight=args.save_weight, save_dir="checkpoints"
         )
         if args.from_resume == 1
         else None
@@ -322,7 +324,7 @@ if __name__ == "__main__":
     - 缩放器: 混合精度训练的梯度缩放
     """
     # 初始化模型和分词器
-    model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
+    model, tokenizer = init_model(lm_config, args.from_weight, save_dir=args.save_dir, device=args.device)
 
     train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
 

@@ -14,6 +14,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 from model.MiniMindModel import MiniMindConfig
 from dataset.llm_dataset import SFTDataset
 from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler
+from trainer.path_utils import resolve_project_paths
 
 warnings.filterwarnings('ignore')
 
@@ -38,7 +39,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
 
         scaler.scale(loss).backward()
 
-        if step % args.accumulation_steps == 0:
+        if step % args.accumulation_steps == 0 or step == iters:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             scaler.step(optimizer)
@@ -78,7 +79,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
                 epoch=epoch,
                 step=step,
                 wandb=wandb,
-                save_dir="../checkpoints",
+                save_dir="checkpoints",
                 scaler=scaler,
             )
 
@@ -90,7 +91,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MiniMind Full SFT")
     # ========== 基础训练参数 ==========
-    parser.add_argument("--save_dir", type=str, default="../out", help="模型保存目录")
+    parser.add_argument("--save_dir", type=str, default="out", help="模型保存目录")
     parser.add_argument("--save_weight", default="full_sft", type=str, help="保存权重的前缀名")
     parser.add_argument("--epochs", type=int, default=2, help="训练轮数（建议1轮zero或2-6轮充分训练）")
     parser.add_argument("--batch_size", type=int, default=16, help="batch size")
@@ -114,7 +115,7 @@ if __name__ == "__main__":
     parser.add_argument("--use_moe", default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
 
     # ========== 数据和恢复参数 ==========
-    parser.add_argument("--data_path", type=str, default="../dataset/sft_mini_512.jsonl", help="预训练数据路径")
+    parser.add_argument("--data_path", type=str, default="dataset/sft_mini_512.jsonl", help="预训练数据路径")
     parser.add_argument("--from_weight", default="pretrain", type=str, help="基于哪个权重训练，为none则从头开始")
     parser.add_argument("--from_resume", default=1, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
 
@@ -125,6 +126,7 @@ if __name__ == "__main__":
 
     # 解析命令行参数
     args = parser.parse_args()
+    args = resolve_project_paths(args, "save_dir", "data_path")
 
     # ========== 1. 初始化环境和随机种子 ==========
     """
@@ -151,7 +153,7 @@ if __name__ == "__main__":
     )
     # 尝试加载断点续训数据
     ckp_data = (
-        lm_checkpoint(lm_config, weight=args.save_weight, save_dir="../checkpoints")
+        lm_checkpoint(lm_config, weight=args.save_weight, save_dir="checkpoints")
         if args.from_resume == 1
         else None
     )
@@ -193,7 +195,7 @@ if __name__ == "__main__":
     - SFT: SFTDataset - 监督微调数据集，包含instruction和response
     - Pretrain: PretrainDataset - 预训练数据集，包含原始文本和mask
     """
-    model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
+    model, tokenizer = init_model(lm_config, args.from_weight, save_dir=args.save_dir, device=args.device)
 
     # 📚 torch.compile加速：JIT编译模型获得20%~40%性能提升
     if args.use_compile == 1:

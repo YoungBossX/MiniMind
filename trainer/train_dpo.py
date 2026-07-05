@@ -15,6 +15,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 from model.MiniMindModel import MiniMindConfig
 from dataset.llm_dataset import DPODataset
 from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler
+from trainer.path_utils import resolve_project_paths
 
 warnings.filterwarnings('ignore')
 
@@ -48,7 +49,7 @@ def logits_to_log_probs(logits, labels):
  
     return log_probs_per_token
 
-def dpo_loss(ref_log_probs, policy_log_probs, mask, beta):
+def dpo_loss(ref_log_probs, policy_log_probs, mask, beta, logprob_reduction="mean"):
     """
     计算 DPO（Direct Preference Optimization）损失。
  
@@ -89,16 +90,17 @@ def dpo_loss(ref_log_probs, policy_log_probs, mask, beta):
     """
     # ── Step 1：计算每条序列的有效长度 ─────────────────────────────
     # clamp_min(1e-8) 防止全 PAD 时除以 0
-    # seq_lengths = mask.sum(dim=1, keepdim=True).clamp_min(1e-8)
-    # seq_lengths shape: [B, 1]
+    seq_lengths = mask.sum(dim=1).clamp_min(1e-8)
  
     # ── Step 2：计算每条序列的平均 log 概率 ────────────────────────
-    # mask 把 PAD 位置清零，只累加有效 token 的 log 概率，再除以有效长度
+    # mask 把 PAD 位置清零。默认用平均 logprob，避免 chosen/rejected 长度差直接主导偏好信号；
+    # 如需复现实验中的序列总 logprob，可传 --logprob_reduction sum。
     # 结果 shape: [B]
-    # ref_log_probs = (ref_log_probs * mask).sum(dim=1) / seq_lengths.squeeze()
-    # policy_log_probs = (policy_log_probs * mask).sum(dim=1) / seq_lengths.squeeze()
     ref_log_probs = (ref_log_probs * mask).sum(dim=1)
     policy_log_probs = (policy_log_probs * mask).sum(dim=1)
+    if logprob_reduction == "mean":
+        ref_log_probs = ref_log_probs / seq_lengths
+        policy_log_probs = policy_log_probs / seq_lengths
  
     # ── Step 3：切分 chosen 和 rejected ────────────────────────────
     # batch 的前一半是 chosen，后一半是 rejected
@@ -192,7 +194,13 @@ def train_epoch(epoch, loader, iters, ref_model, lm_config, start_step=0, wandb=
 
             # ── 计算 DPO loss ─────────────────────────────────────────
             # dpo_loss 内部会把 [B, seq_len] 聚合成标量
-            dpo_loss_val = dpo_loss(ref_log_probs, policy_log_probs, mask, beta=args.beta)
+            dpo_loss_val = dpo_loss(
+                ref_log_probs,
+                policy_log_probs,
+                mask,
+                beta=beta,
+                logprob_reduction=args.logprob_reduction,
+            )
  
             # 加上 MoE 辅助损失（非 MoE 模型此项为 0）
             # aux_loss 用于保证 MoE 各专家负载均衡
@@ -205,7 +213,7 @@ def train_epoch(epoch, loader, iters, ref_model, lm_config, start_step=0, wandb=
         scaler.scale(loss).backward()
 
         # ── 梯度累积满足条件时更新参数 ───────────────────────────────
-        if step % args.accumulation_steps == 0:
+        if step % args.accumulation_steps == 0 or step == iters:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             scaler.step(optimizer)
@@ -250,7 +258,7 @@ def train_epoch(epoch, loader, iters, ref_model, lm_config, start_step=0, wandb=
                 epoch=epoch,
                 step=step,
                 wandb=wandb,
-                save_dir="../checkpoints",
+                save_dir="checkpoints",
             )
             model.train()
 
@@ -263,7 +271,7 @@ if __name__ == "__main__":
     # 📚 模型保存相关参数
     # save_dir: 指定LoRA权重和检查点的保存目录
     # lora_name: LoRA权重的标识符，用于区分不同任务的LoRA适配器
-    parser.add_argument("--save_dir", type=str, default="../out", help="DPO权重保存目录")
+    parser.add_argument("--save_dir", type=str, default="out", help="DPO权重保存目录")
     parser.add_argument("--save_weight", type=str, default="dpo", help="保存权重的前缀名")
 
     # 📚 训练设备和精度配置
@@ -286,6 +294,13 @@ if __name__ == "__main__":
     # beta 越小：偏好学习更激进，但可能遗忘 SFT 知识
     # 常用范围：0.1 ~ 0.5
     parser.add_argument("--beta", type=float, default=0.1, help="DPO beta 超参")
+    parser.add_argument(
+        "--logprob_reduction",
+        type=str,
+        default="mean",
+        choices=["mean", "sum"],
+        help="DPO 序列 logprob 聚合方式：mean 减少长度偏置，sum 复现传统序列总 logprob",
+    )
 
     # 📚 数据加载和训练优化
     # num_workers: 数据加载的并行进程数，提高数据读取效率
@@ -315,7 +330,7 @@ if __name__ == "__main__":
     # data_path: 训练数据的文件路径，通常是JSONL格式
     # from_weight: 基于哪个预训练权重进行LoRA微调
     # from_resume: 是否从检查点恢复训练，支持断点续训
-    parser.add_argument("--data_path", type=str, default="../dataset/dpo.jsonl", help="训练数据路径")
+    parser.add_argument("--data_path", type=str, default="dataset/dpo.jsonl", help="训练数据路径")
     # DPO 基于 SFT 模型进行对齐优化，from_weight 通常是 "full_sft"
     parser.add_argument("--from_weight", default="full_sft", type=str, help="基于哪个权重训练，默认full_sft")
     parser.add_argument("--from_resume", default=1, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
@@ -327,6 +342,7 @@ if __name__ == "__main__":
     parser.add_argument("--wandb_project", type=str, default="MiniMind-LoRA", help="wandb项目名")
 
     args = parser.parse_args()
+    args = resolve_project_paths(args, "save_dir", "data_path")
 
     # ========== 1. 初始化环境和随机种子 ==========
     # 📚 分布式训练初始化
@@ -362,7 +378,7 @@ if __name__ == "__main__":
     # lm_checkpoint(): 检查是否存在可用的检查点
     # 如果from_resume=1，则尝试加载之前的训练状态
     ckp_data = (
-        lm_checkpoint(lm_config, weight=args.save_weight, save_dir="../checkpoints")
+        lm_checkpoint(lm_config, weight=args.save_weight, save_dir="checkpoints")
         if args.from_resume == 1
         else None
     )
@@ -404,13 +420,13 @@ if __name__ == "__main__":
     # 📚 模型初始化
     # init_model(): 加载预训练模型和tokenizer
     # from_weight指定基础权重文件
-    model, tokenizer = init_model(lm_config, args.from_weight, device=args.device)
+    model, tokenizer = init_model(lm_config, args.from_weight, save_dir=args.save_dir, device=args.device)
     Logger(f"策略模型总参数量：{sum(p.numel() for p in model.parameters()) / 1e6:.3f} M")
 
     # 参考模型（reference model）：冻结的 baseline
     # 与策略模型初始权重完全相同，但整个训练过程不更新
     # 作用：正则化项，防止策略模型过度优化偏好而遗忘语言能力
-    ref_model, _ = init_model(lm_config, args.from_weight, device=args.device)
+    ref_model, _ = init_model(lm_config, args.from_weight, save_dir=args.save_dir, device=args.device)
     ref_model.eval() # 切换到推理模式（关闭 dropout 等）
     ref_model.requires_grad_(False) # 冻结所有参数，不参与反向传播
     Logger(f"参考模型总参数量：{sum(p.numel() for p in ref_model.parameters()) / 1e6:.3f} M")

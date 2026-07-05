@@ -20,6 +20,7 @@ from trainer.trainer_utils import (
     Logger, is_main_process, lm_checkpoint,
     init_distributed_mode, setup_seed, SkipBatchSampler, init_model
 )
+from trainer.path_utils import resolve_project_paths
  
 warnings.filterwarnings('ignore')
 
@@ -140,6 +141,7 @@ def grpo_train_epoch(epoch, loader, iters, ref_model, reward_model, reward_token
         # ---- 3. 计算 actor 和 ref 的 per-token log-prob ----
         with autocast_ctx:
             actor_logps, entropy_per_token = get_per_token_logps(model, outputs, R)
+            old_logps = actor_logps.detach()
             res = model(outputs) if lm_config.use_moe else None
             aux_loss = res.aux_loss if res is not None else torch.tensor(0.0, device=args.device)
  
@@ -182,7 +184,7 @@ def grpo_train_epoch(epoch, loader, iters, ref_model, reward_model, reward_token
         # ---- 7. Policy loss (带 clip) ----
         # ratio = π_new / π_old, 由于 GRPO 每步只 forward 一次, ratio 通过
         # exp(logp - logp.detach()) 实现, 梯度只流过分子
-        ratio = torch.exp(actor_logps - actor_logps.detach())  # [B*G, R]
+        ratio = torch.exp(actor_logps - old_logps)  # [B*G, R]
         adv = advantages.unsqueeze(1)  # [B*G, 1] broadcast to [B*G, R]
         surr1 = ratio * adv
         surr2 = torch.clamp(ratio, 1.0 - args.clip_epsilon, 1.0 + args.clip_epsilon) * adv
@@ -199,7 +201,7 @@ def grpo_train_epoch(epoch, loader, iters, ref_model, reward_model, reward_token
         loss.backward()
  
         # ---- 8. 梯度步 ----
-        if step % args.accumulation_steps == 0:
+        if step % args.accumulation_steps == 0 or step == iters:
             if args.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step()
@@ -240,7 +242,7 @@ def grpo_train_epoch(epoch, loader, iters, ref_model, reward_model, reward_token
                 })
  
         # ---- 10. 保存 ----
-        if (step % args.save_interval == 0 or step == iters - 1) and is_main_process():
+        if (step % args.save_interval == 0 or step == iters) and is_main_process():
             model.eval()
             moe_suffix = '_moe' if lm_config.use_moe else ''
             ckp = f'{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
@@ -249,17 +251,17 @@ def grpo_train_epoch(epoch, loader, iters, ref_model, reward_model, reward_token
             state_dict = raw_model.state_dict()
             torch.save({k: v.half().cpu() for k, v in state_dict.items()}, ckp)
             lm_checkpoint(lm_config, weight=args.save_weight, model=model, optimizer=optimizer,
-                          epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints',
+                          epoch=epoch, step=step, wandb=wandb, save_dir='checkpoints',
                           scheduler=scheduler)
             model.train()
             del state_dict
  
-        del prompt_inputs, outputs, completion_ids, actor_logps, ref_logps
+        del prompt_inputs, outputs, completion_ids, actor_logps, old_logps, ref_logps
         del completions, rewards, advantages, completion_mask
  
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MiniMind GRPO")
-    parser.add_argument("--save_dir", type=str, default="../out")
+    parser.add_argument("--save_dir", type=str, default="out")
     parser.add_argument('--save_weight', default='grpo', type=str)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=2)
@@ -276,18 +278,19 @@ if __name__ == "__main__":
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1])
     parser.add_argument('--max_seq_len', default=66, type=int, help="Prompt 最大长度")
     parser.add_argument("--max_gen_len", type=int, default=512, help="生成最大长度")
-    parser.add_argument("--data_path", type=str, default="../dataset/rlaif-mini.jsonl")
+    parser.add_argument("--data_path", type=str, default="dataset/rlaif-mini.jsonl")
     parser.add_argument("--num_generations", type=int, default=4,  help="每个 prompt 生成几个回答 (G). 越大 advantage 越稳定, 但越慢")
     parser.add_argument("--beta", type=float, default=0.02, help="KL 惩罚系数")
     parser.add_argument("--clip_epsilon", type=float, default=0.2, help="PPO 风格 clip 参数")
     parser.add_argument("--entropy_coef", type=float, default=0.01, help="Entropy bonus 系数")
     parser.add_argument("--reasoning", type=int, default=1, choices=[0, 1])
-    parser.add_argument("--reward_model_path", type=str, default="../internlm2-1_8b-reward")
+    parser.add_argument("--reward_model_path", type=str, default="internlm2-1_8b-reward")
     parser.add_argument('--from_resume', default=1, type=int, choices=[0, 1])
     parser.add_argument("--use_wandb", action="store_true")
     parser.add_argument("--wandb_project", type=str, default="MiniMind-GRPO")
     parser.add_argument("--use_compile", default=0, type=int, choices=[0, 1])
     args = parser.parse_args()
+    args = resolve_project_paths(args, "save_dir", "data_path", "reward_model_path")
  
     # ========== 1. 初始化 ==========
     local_rank = init_distributed_mode()
@@ -302,7 +305,7 @@ if __name__ == "__main__":
         num_hidden_layers=args.num_hidden_layers,
         use_moe=bool(args.use_moe)
     )
-    ckp_data = (lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints')
+    ckp_data = (lm_checkpoint(lm_config, weight=args.save_weight, save_dir='checkpoints')
                 if args.from_resume == 1 else None)
  
     # ========== 3. 混合精度 ==========
@@ -341,7 +344,7 @@ if __name__ == "__main__":
     optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
     loader_for_count = DataLoader(train_ds, batch_size=args.batch_size, sampler=train_sampler)
     iters = len(loader_for_count)
-    total_steps = (iters // args.accumulation_steps) * args.epochs
+    total_steps = ((iters + args.accumulation_steps - 1) // args.accumulation_steps) * args.epochs
     scheduler = CosineAnnealingLR(optimizer, T_max=total_steps, eta_min=args.learning_rate / 10)
  
     # ========== 7. 恢复 ==========
@@ -390,7 +393,7 @@ if __name__ == "__main__":
         state_dict = raw_model.state_dict()
         torch.save({k: v.half().cpu() for k, v in state_dict.items()}, ckp)
         lm_checkpoint(lm_config, weight=args.save_weight, model=model, optimizer=optimizer,
-                      epoch=args.epochs, step=0, wandb=wandb, save_dir='../checkpoints',
+                      epoch=args.epochs, step=0, wandb=wandb, save_dir='checkpoints',
                       scheduler=scheduler)
         Logger(f"Final model saved to {ckp}")
  

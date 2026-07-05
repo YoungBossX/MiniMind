@@ -226,7 +226,7 @@ def main():
             all_metrics[f"gen_{k}"] = v
         all_assertions.append({"name": "gen_not_all_empty", "passed": gen_metrics["empty_rate"] < 1.0,
                                "detail": f"empty_rate={gen_metrics['empty_rate']:.2f}"})
-        all_assertions.append({"name": "gen_eos_reasonable", "passed": gen_metrics["eos_rate"] >= 0,
+        all_assertions.append({"name": "gen_eos_reasonable", "passed": gen_metrics["eos_rate"] > 0,
                                "detail": f"eos_rate={gen_metrics['eos_rate']:.2f}"})
 
     # Reasoning format
@@ -236,8 +236,16 @@ def main():
         for k, v in format_metrics.items():
             print(f"  {k}: {v:.4f}")
             all_metrics[f"fmt_{k}"] = v
-        all_assertions.append({"name": "format_tags_present", "passed": format_metrics["tag_complete"] >= 0,
-                               "detail": f"complete_rate={format_metrics['tag_complete']:.2f}"})
+        requires_reason_tags = args.weight == "reason"
+        all_assertions.append({
+            "name": "format_tags_present",
+            "passed": (format_metrics["tag_complete"] > 0) if requires_reason_tags else True,
+            "detail": (
+                f"complete_rate={format_metrics['tag_complete']:.2f}"
+                if requires_reason_tags
+                else "not required for non-reason weights"
+            ),
+        })
 
     report = generate_report(f"benchmark_{args.weight}", all_metrics, all_assertions, REPORT_DIR)
 

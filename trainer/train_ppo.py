@@ -39,6 +39,7 @@ from trainer.trainer_utils import (
     Logger, is_main_process, lm_checkpoint,
     init_distributed_mode, setup_seed, SkipBatchSampler, init_model
 )
+from trainer.path_utils import resolve_project_paths
  
 warnings.filterwarnings('ignore')
  
@@ -213,7 +214,7 @@ def calculate_rewards(prompts, responses, reward_model, reward_tokenizer, args):
 #  所有计算都在 @torch.no_grad() 下完成, 因为这里只是收集数据,
 #  真正的梯度计算在后面的 ppo_update() 里.
 @torch.no_grad()
-def collect_rollout(prompts, actor_model, critic_model, old_actor_model, ref_model,
+def collect_rollout(prompts, actor_model, critic_model, ref_model,
                     reward_model, reward_tokenizer, tokenizer, args, autocast_ctx):
     """
     收集一个 batch 的完整 rollout 数据.
@@ -240,6 +241,8 @@ def collect_rollout(prompts, actor_model, critic_model, old_actor_model, ref_mod
     # DDP 包装的模型需要 .module 才能调用 generate
     # gen_out 形状: [B, P+R], 其中 P=prompt长度, R=response长度 (可变)
     model_for_gen = actor_model.module if isinstance(actor_model, DistributedDataParallel) else actor_model
+    was_training = model_for_gen.training
+    model_for_gen.eval()
     gen_out = model_for_gen.generate(
         input_ids=enc.input_ids, attention_mask=enc.attention_mask,
         max_new_tokens=args.max_gen_len, do_sample=True, temperature=0.8,
@@ -272,15 +275,17 @@ def collect_rollout(prompts, actor_model, critic_model, old_actor_model, ref_mod
         values_seq = critic_model(input_ids=gen_out, attention_mask=full_mask)  # [B, P+R]
         # 取 shifted 的 values (对齐 labels)
         values_seq = values_seq[:, :-1]  # [B, T]
-        # Old Actor: 冻结的上一版 actor, 用于计算 importance sampling ratio
-        old_logits = old_actor_model(input_ids=gen_out, attention_mask=full_mask).logits[:, :-1]  # [B, T, V]
+        # Sampled policy: 生成这批样本时的 actor 分布，作为 PPO ratio 的分母。
+        sampled_policy_logits = model_for_gen(input_ids=gen_out, attention_mask=full_mask).logits[:, :-1]  # [B, T, V]
         # Reference Model: 冻结的初始模型, 用于计算 KL 散度
         ref_logits = ref_model(input_ids=gen_out, attention_mask=full_mask).logits[:, :-1]  # [B, T, V]
+    if was_training:
+        model_for_gen.train()
     
     # 计算 per-token log-probability
     # log_softmax 得到 log(概率分布), gather 取出 label 对应的那个 log-prob
     # 例如 logits=[0.1, 0.8, 0.1], label=1, 则 log_softmax→[-2.4, -0.4, -2.4], gather→-0.4
-    old_logp = F.log_softmax(old_logits, dim=-1).gather(2, labels.unsqueeze(-1)).squeeze(-1)  # [B, T]
+    old_logp = F.log_softmax(sampled_policy_logits, dim=-1).gather(2, labels.unsqueeze(-1)).squeeze(-1)  # [B, T]
     ref_logp = F.log_softmax(ref_logits, dim=-1).gather(2, labels.unsqueeze(-1)).squeeze(-1)  # [B, T]
  
     # ---- 6. 用 GAE 计算 per-token advantage ----
@@ -441,7 +446,7 @@ def ppo_update(rollout, actor_model, critic_model, actor_optimizer, critic_optim
         # ================================================================
         #  Early Stopping: 当新旧策略差异过大时停止当前 epoch
         # ================================================================
-        # approx_kl 衡量当前 actor 和 old_actor 之间的 KL
+        # approx_kl 衡量当前 actor 和采样时 actor 之间的 KL
         # 如果太大, 说明这批数据已经被 "用完了", 继续更新反而有害
         log_ratio_old = actor_logp - old_logp  # [B, T]
         approx_kl = (log_ratio_old.exp() - 1 - log_ratio_old)  # [B, T]
@@ -487,7 +492,7 @@ def ppo_update(rollout, actor_model, critic_model, actor_optimizer, critic_optim
 # ============================================================================
 #  训练一个 Epoch
 # ============================================================================
-def ppo_train_epoch(epoch, loader, iters, old_actor_model, ref_model,
+def ppo_train_epoch(epoch, loader, iters, ref_model,
                     actor_scheduler, critic_scheduler,
                     reward_model, reward_tokenizer, start_step=0, wandb=None):
     """
@@ -511,7 +516,7 @@ def ppo_train_epoch(epoch, loader, iters, old_actor_model, ref_model,
         # 这一步: 生成回答 → 打分 → 计算 value → 计算 GAE advantage
         # 全程 no_grad, 不消耗计算图内存
         rollout = collect_rollout(
-            prompts, actor_model, critic_model, old_actor_model, ref_model,
+            prompts, actor_model, critic_model, ref_model,
             reward_model, reward_tokenizer, tokenizer, args, autocast_ctx
         )
  
@@ -527,7 +532,7 @@ def ppo_train_epoch(epoch, loader, iters, old_actor_model, ref_model,
  
         # ---- Step 3: 应用梯度 ----
         # 如果使用梯度累积 (accumulation_steps > 1), 等累积够了再 step
-        if step % args.accumulation_steps == 0:
+        if step % args.accumulation_steps == 0 or step == iters:
             clip_grad_norm_(actor_model.parameters(), args.grad_clip)
             clip_grad_norm_(critic_model.parameters(), args.grad_clip)
             actor_optimizer.step()
@@ -579,19 +584,7 @@ def ppo_train_epoch(epoch, loader, iters, old_actor_model, ref_model,
                     f"AvgLen:{avg_len:.1f}, aLR:{actor_lr:.2e}, cLR:{critic_lr:.2e}"
                 )
  
-        # ---- Step 5: 同步 Old Actor ----
-        # 每隔几步把当前 Actor 的参数复制到 Old Actor
-        # Old Actor 用于计算 importance sampling ratio
-        # 如果更新太频繁, ratio 总是 ≈1, PPO 退化为普通 PG
-        # 如果更新太不频繁, ratio 偏离 1 太远, 训练不稳定
-        if (step + 1) % args.update_old_actor_freq == 0:
-            # 在 device 上直接 clone, 不走 CPU
-            raw_actor = actor_model.module if isinstance(actor_model, DistributedDataParallel) else actor_model
-            raw_actor = getattr(raw_actor, '_orig_mod', raw_actor)
-            for p_old, p_new in zip(old_actor_model.parameters(), raw_actor.parameters()):
-                p_old.data.copy_(p_new.data)
- 
-        # ---- Step 6: 保存 checkpoint ----
+        # ---- Step 5: 保存 checkpoint ----
         if (step % args.save_interval == 0 or step == iters) and is_main_process():
             actor_model.eval()
             moe_suffix = '_moe' if lm_config.use_moe else ''
@@ -602,7 +595,7 @@ def ppo_train_epoch(epoch, loader, iters, old_actor_model, ref_model,
             torch.save({k: v.half().cpu() for k, v in actor_state.items()}, ckp)
  
             lm_checkpoint(lm_config, weight=args.save_weight, model=actor_model, optimizer=actor_optimizer,
-                          epoch=epoch, step=step, wandb=wandb, save_dir='../checkpoints',
+                          epoch=epoch, step=step, wandb=wandb, save_dir='checkpoints',
                           scheduler=actor_scheduler, critic_model=critic_model,
                           critic_optimizer=critic_optimizer, critic_scheduler=critic_scheduler)
             actor_model.train()
@@ -617,7 +610,7 @@ def ppo_train_epoch(epoch, loader, iters, old_actor_model, ref_model,
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MiniMind PPO (Improved)")
     # --- 基础参数 ---
-    parser.add_argument("--save_dir", type=str, default="../out")
+    parser.add_argument("--save_dir", type=str, default="out")
     parser.add_argument('--save_weight', default='ppo_actor', type=str)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=4)
@@ -637,7 +630,7 @@ if __name__ == "__main__":
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1])
     parser.add_argument('--max_seq_len', default=66, type=int, help="Prompt 最大长度")
     parser.add_argument("--max_gen_len", type=int, default=512, help="生成最大长度")
-    parser.add_argument("--data_path", type=str, default="../dataset/rlaif-mini.jsonl")
+    parser.add_argument("--data_path", type=str, default="dataset/rlaif-mini.jsonl")
  
     # --- PPO 核心超参数 ---
     parser.add_argument("--clip_epsilon", type=float, default=0.2, help="PPO clip 参数 (原版 0.1, 建议 0.2)")
@@ -651,13 +644,13 @@ if __name__ == "__main__":
  
     # --- 其他 ---
     parser.add_argument("--reasoning", type=int, default=1, choices=[0, 1])
-    parser.add_argument("--update_old_actor_freq", type=int, default=4)
-    parser.add_argument("--reward_model_path", type=str, default="../internlm2-1_8b-reward")
+    parser.add_argument("--reward_model_path", type=str, default="internlm2-1_8b-reward")
     parser.add_argument('--from_resume', default=1, type=int, choices=[0, 1])
     parser.add_argument("--use_wandb", action="store_true")
     parser.add_argument("--wandb_project", type=str, default="MiniMind-PPO-Improved")
     parser.add_argument("--use_compile", default=0, type=int, choices=[0, 1])
     args = parser.parse_args()
+    args = resolve_project_paths(args, "save_dir", "data_path", "reward_model_path")
  
     # ========== 1. 初始化环境 ==========
     local_rank = init_distributed_mode()
@@ -672,7 +665,7 @@ if __name__ == "__main__":
         num_hidden_layers=args.num_hidden_layers,
         use_moe=bool(args.use_moe)
     )
-    ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='../checkpoints') if args.from_resume == 1 else None
+    ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='checkpoints') if args.from_resume == 1 else None
  
     # ========== 3. 混合精度 ==========
     device_type = "cuda" if "cuda" in args.device else "cpu"
@@ -705,17 +698,13 @@ if __name__ == "__main__":
     base_weight = "reason" if args.reasoning == 1 else "full_sft"
  
     # Actor
-    actor_model, tokenizer = init_model(lm_config, base_weight, device=args.device)
+    actor_model, tokenizer = init_model(lm_config, base_weight, save_dir=args.save_dir, device=args.device)
     if args.use_compile == 1:
         actor_model = torch.compile(actor_model)
         Logger('torch.compile enabled')
  
-    # Old Actor (frozen)
-    old_actor_model, _ = init_model(lm_config, base_weight, device=args.device)
-    old_actor_model = old_actor_model.eval().requires_grad_(False)
- 
     # Reference (frozen)
-    ref_model, _ = init_model(lm_config, base_weight, device=args.device)
+    ref_model, _ = init_model(lm_config, base_weight, save_dir=args.save_dir, device=args.device)
     ref_model = ref_model.eval().requires_grad_(False)
  
     # Critic (从同样的 base weight 初始化, value_head 随机初始化)
@@ -740,7 +729,7 @@ if __name__ == "__main__":
  
     loader_for_count = DataLoader(train_ds, batch_size=args.batch_size, sampler=train_sampler)
     iters = len(loader_for_count)
-    total_optimizer_steps = (iters // args.accumulation_steps) * args.epochs
+    total_optimizer_steps = ((iters + args.accumulation_steps - 1) // args.accumulation_steps) * args.epochs
     actor_scheduler = CosineAnnealingLR(actor_optimizer, T_max=total_optimizer_steps, eta_min=args.learning_rate / 10)
     critic_scheduler = CosineAnnealingLR(critic_optimizer, T_max=total_optimizer_steps, eta_min=args.critic_learning_rate / 10)
  
@@ -762,7 +751,6 @@ if __name__ == "__main__":
         critic_model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}
         actor_model = DistributedDataParallel(actor_model, device_ids=[local_rank])
         critic_model = DistributedDataParallel(critic_model, device_ids=[local_rank])
-        old_actor_model.to(args.device)
  
     # ========== 9. 训练 ==========
     Logger("=" * 70)
@@ -781,10 +769,10 @@ if __name__ == "__main__":
  
         if skip > 0:
             Logger(f'Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}步, 从 step {start_step + 1} 开始')
-            ppo_train_epoch(epoch, loader, len(loader) + skip, old_actor_model, ref_model,
+            ppo_train_epoch(epoch, loader, len(loader) + skip, ref_model,
                             actor_scheduler, critic_scheduler, reward_model, reward_tokenizer, start_step, wandb)
         else:
-            ppo_train_epoch(epoch, loader, len(loader), old_actor_model, ref_model,
+            ppo_train_epoch(epoch, loader, len(loader), ref_model,
                             actor_scheduler, critic_scheduler, reward_model, reward_tokenizer, 0, wandb)
  
     # 训练结束后总是保存一次
@@ -798,7 +786,7 @@ if __name__ == "__main__":
         actor_state = raw_actor.state_dict()
         torch.save({k: v.half().cpu() for k, v in actor_state.items()}, ckp)
         lm_checkpoint(lm_config, weight=args.save_weight, model=actor_model, optimizer=actor_optimizer,
-                      epoch=args.epochs, step=0, wandb=wandb, save_dir='../checkpoints',
+                      epoch=args.epochs, step=0, wandb=wandb, save_dir='checkpoints',
                       scheduler=actor_scheduler, critic_model=critic_model,
                       critic_optimizer=critic_optimizer, critic_scheduler=critic_scheduler)
         Logger(f"Final model saved to {ckp}")

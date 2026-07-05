@@ -2,6 +2,7 @@
 import argparse
 import warnings
 import torch
+from pathlib import Path
 from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer
 from model.MiniMindModel import MiniMindConfig, MiniMindForCausalLM
 from trainer.trainer_utils import setup_seed
@@ -9,10 +10,19 @@ from trainer.trainer_utils import setup_seed
 warnings.filterwarnings("ignore")
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR_PATH = Path(BASE_DIR)
 
 def init_model(args):
-    tokenizer = AutoTokenizer.from_pretrained(args.load_from)
-    if "model" in args.load_from:
+    load_from_path = Path(args.load_from).expanduser()
+    load_from_resolved = (
+        load_from_path if load_from_path.is_absolute() else BASE_DIR_PATH / load_from_path
+    ).resolve()
+    native_model_dir = (BASE_DIR_PATH / "model").resolve()
+    is_native_model = args.load_from == "model" or load_from_resolved == native_model_dir
+    tokenizer_source = str(load_from_resolved) if is_native_model else args.load_from
+
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_source)
+    if is_native_model:
         model = MiniMindForCausalLM(
             MiniMindConfig(
                 hidden_size=args.hidden_size,
@@ -25,7 +35,10 @@ def init_model(args):
         )
         moe_suffix = "_moe" if hasattr(args, "use_moe") and args.use_moe else ""
         
-        ckp = os.path.join(BASE_DIR, args.save_dir, f"{args.weight}_{args.hidden_size}{moe_suffix}.pth")
+        save_dir = Path(args.save_dir).expanduser()
+        if not save_dir.is_absolute():
+            save_dir = BASE_DIR_PATH / save_dir
+        ckp = save_dir / f"{args.weight}_{args.hidden_size}{moe_suffix}.pth"
         
         model.load_state_dict(
             torch.load(ckp, map_location=args.device), strict=True
@@ -33,7 +46,10 @@ def init_model(args):
 
         if args.lora_weight != "None":
             from model.model_lora import apply_lora, load_lora
-            lora_path = os.path.join(BASE_DIR, args.lora_dir, f"{args.lora_weight}_{args.hidden_size}{moe_suffix}.pth")
+            lora_dir = Path(args.lora_dir).expanduser()
+            if not lora_dir.is_absolute():
+                lora_dir = BASE_DIR_PATH / lora_dir
+            lora_path = lora_dir / f"{args.lora_weight}_{args.hidden_size}{moe_suffix}.pth"
             apply_lora(model, args.lora_rank, args.lora_alpha, args.lora_target_modules)
             load_lora(model, lora_path)
             print(f"[LoRA] 已加载权重: {lora_path}")

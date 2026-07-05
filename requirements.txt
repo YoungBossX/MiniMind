@@ -1,0 +1,8 @@
+torch
+transformers
+datasets
+numpy
+PyYAML
+swanlab
+accelerate
+pytest
