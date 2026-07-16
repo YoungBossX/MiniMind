@@ -42,7 +42,7 @@ def run_script(script_path, args_list):
     return result.returncode
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description="MiniMind Run All Evaluations")
     parser.add_argument("--checkpoint_path", type=str, default="", help="模型权重 .pth 路径（为空则使用随机初始化模型）")
     parser.add_argument("--tokenizer_path", type=str, default="", help="Tokenizer 目录路径")
@@ -55,7 +55,7 @@ def main():
     parser.add_argument("--skip_qa", action="store_true", help="跳过 QA 评估")
     parser.add_argument("--skip_generation", action="store_true", help="跳过生成约束评估")
     parser.add_argument("--skip_speed", action="store_true", help="跳过速度评估")
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
 
     if not args.checkpoint_path:
         print("[run_all] WARNING: checkpoint_path 为空，将使用随机初始化模型。部分评估（QA/Generation）结果无参考价值。")
@@ -96,10 +96,18 @@ def main():
         "--dtype", dtype,
         "--seed", str(args.seed),
     ]
+    if model_cfg.get("use_moe", False):
+        common.append("--use_moe")
 
     script_dir = os.path.dirname(os.path.abspath(__file__))
 
     all_metrics = {}
+    stage_status = {
+        "lm": "skipped",
+        "qa": "skipped",
+        "generation": "skipped",
+        "speed": "skipped",
+    }
     failed_samples = {"qa": [], "gen": []}
 
     # 1. LM Evaluation
@@ -107,14 +115,17 @@ def main():
         lm_data = _resolve_path("lm_eval_path", "evals/data/lm_eval_sample.txt")
         lm_output = os.path.join(output_dir, "lm_eval.json")
         if os.path.exists(lm_data):
-            run_script(os.path.join(script_dir, "eval_lm.py"), common + [
+            lm_returncode = run_script(os.path.join(script_dir, "eval_lm.py"), common + [
                 "--data_path", lm_data,
                 "--output_path", lm_output,
                 "--batch_size", str(eval_cfg.get("batch_size", 4)),
                 "--max_length", str(eval_cfg.get("max_length", 512)),
             ])
-            if os.path.exists(lm_output):
+            if lm_returncode == 0 and os.path.exists(lm_output):
                 all_metrics["lm"] = read_json(lm_output)
+                stage_status["lm"] = "success"
+            else:
+                stage_status["lm"] = "failed"
         else:
             print(f"[run_all] SKIP lm_eval: data not found ({lm_data})")
 
@@ -124,7 +135,7 @@ def main():
         qa_output = os.path.join(output_dir, "qa_eval.json")
         qa_preds = os.path.join(output_dir, "qa_predictions.jsonl")
         if os.path.exists(qa_data):
-            run_script(os.path.join(script_dir, "eval_qa.py"), common + [
+            qa_returncode = run_script(os.path.join(script_dir, "eval_qa.py"), common + [
                 "--data_path", qa_data,
                 "--output_path", qa_output,
                 "--predictions_path", qa_preds,
@@ -132,8 +143,11 @@ def main():
                 "--temperature", str(gen_cfg.get("temperature", 0.7)),
                 "--top_p", str(gen_cfg.get("top_p", 0.9)),
             ])
-            if os.path.exists(qa_output):
+            if qa_returncode == 0 and os.path.exists(qa_output):
                 all_metrics["qa"] = read_json(qa_output)
+                stage_status["qa"] = "success"
+            else:
+                stage_status["qa"] = "failed"
         else:
             print(f"[run_all] SKIP qa_eval: data not found ({qa_data})")
 
@@ -143,7 +157,7 @@ def main():
         gen_output = os.path.join(output_dir, "generation_eval.json")
         gen_preds = os.path.join(output_dir, "generation_predictions.jsonl")
         if os.path.exists(gen_data):
-            run_script(os.path.join(script_dir, "eval_generation.py"), common + [
+            generation_returncode = run_script(os.path.join(script_dir, "eval_generation.py"), common + [
                 "--data_path", gen_data,
                 "--output_path", gen_output,
                 "--predictions_path", gen_preds,
@@ -151,22 +165,29 @@ def main():
                 "--temperature", str(gen_cfg.get("temperature", 0.7)),
                 "--top_p", str(gen_cfg.get("top_p", 0.9)),
             ])
-            if os.path.exists(gen_output):
+            if generation_returncode == 0 and os.path.exists(gen_output):
                 all_metrics["generation"] = read_json(gen_output)
+                stage_status["generation"] = "success"
+            else:
+                stage_status["generation"] = "failed"
         else:
             print(f"[run_all] SKIP generation_eval: data not found ({gen_data})")
 
     # 4. Speed Evaluation
     if not args.skip_speed:
         speed_output = os.path.join(output_dir, "speed_eval.json")
-        run_script(os.path.join(script_dir, "eval_speed.py"), common + [
+        speed_returncode = run_script(os.path.join(script_dir, "eval_speed.py"), common + [
             "--output_path", speed_output,
             "--max_new_tokens", str(gen_cfg.get("max_new_tokens", 256)),
             "--warmup_runs", str(eval_cfg.get("warmup_runs", 3)),
             "--repeat_runs", str(eval_cfg.get("repeat_runs", 10)),
+            "--batch_size", str(eval_cfg.get("batch_size", 1)),
         ])
-        if os.path.exists(speed_output):
+        if speed_returncode == 0 and os.path.exists(speed_output):
             all_metrics["speed"] = read_json(speed_output)
+            stage_status["speed"] = "success"
+        else:
+            stage_status["speed"] = "failed"
 
     # Generate report
     print(f"\n{'='*60}")
@@ -181,10 +202,16 @@ def main():
         dtype=dtype,
         seed=args.seed,
         failed_samples=failed_samples,
+        stage_status=stage_status,
     )
 
-    print(f"\n[run_all] All evaluations complete. Results in: {output_dir}/")
+    if "failed" in stage_status.values():
+        print(f"\n[run_all] Evaluation failed. Results in: {output_dir}/")
+        return 1
+
+    print(f"\n[run_all] All requested evaluations complete. Results in: {output_dir}/")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

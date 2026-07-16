@@ -59,11 +59,17 @@ def load_model_and_tokenizer(
     )
     model = MiniMindForCausalLM(config)
 
-    if checkpoint_path and os.path.exists(checkpoint_path):
-        state_dict = torch.load(checkpoint_path, map_location="cpu")
+    if checkpoint_path and not os.path.exists(checkpoint_path):
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    if checkpoint_path:
+        state_dict = torch.load(
+            checkpoint_path, map_location="cpu", weights_only=True
+        )
         model.load_state_dict(state_dict, strict=True)
 
-    if lora_path and os.path.exists(lora_path):
+    if lora_path and not os.path.exists(lora_path):
+        raise FileNotFoundError(f"LoRA checkpoint not found: {lora_path}")
+    if lora_path:
         from model.model_lora import apply_lora, load_lora
         apply_lora(model, lora_rank, lora_alpha, ["q_proj", "v_proj", "k_proj", "o_proj"])
         load_lora(model, lora_path)

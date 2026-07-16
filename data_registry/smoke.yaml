@@ -1,0 +1,17 @@
+datasets:
+  - name: smoke_pretrain
+    stage: pretrain
+    path: eval/test_data/pretrain_smoke.jsonl
+    purpose: framework smoke test
+  - name: smoke_sft
+    stage: sft
+    path: eval/test_data/sft_smoke.jsonl
+    purpose: framework smoke test
+  - name: smoke_dpo
+    stage: dpo
+    path: eval/test_data/dpo_smoke.jsonl
+    purpose: framework smoke test
+  - name: smoke_rlaif
+    stage: rlaif
+    path: eval/test_data/rlaif_smoke.jsonl
+    purpose: framework smoke test

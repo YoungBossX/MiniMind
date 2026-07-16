@@ -33,6 +33,7 @@ target/
 # Logs
 logs
 *.log
+.tmp/
 
 # OS Specific Files
 .DS_Store

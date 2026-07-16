@@ -146,6 +146,7 @@ def compute_speed_metrics(
     peak_memory_mb: float = None,
     device: str = "cpu",
     dtype: str = "fp32",
+    batch_size: int = 1,
 ) -> dict:
     """计算推理速度指标
 
@@ -173,6 +174,7 @@ def compute_speed_metrics(
         "peak_gpu_memory_mb": peak_memory_mb,
         "device": device,
         "dtype": dtype,
+        "batch_size": batch_size,
         "num_runs": len(latencies_ms),
         "total_time_seconds": total_time_s,
     }

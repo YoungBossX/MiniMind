@@ -23,6 +23,8 @@ from evals.core.io_utils import write_json
 def evaluate_speed(model, tokenizer, device="cpu", max_new_tokens=128,
                    warmup_runs=3, repeat_runs=10, batch_size=1):
     """评估推理速度"""
+    if batch_size < 1:
+        raise ValueError("batch_size must be at least 1")
     test_prompts = [
         "你好，请介绍一下深度学习。",
         "请用Python写一个快速排序算法。",
@@ -40,12 +42,29 @@ def evaluate_speed(model, tokenizer, device="cpu", max_new_tokens=128,
 
     for run_idx in range(warmup_runs + repeat_runs):
         prompt = test_prompts[run_idx % len(test_prompts)]
-        messages = [{"role": "user", "content": prompt}]
-        formatted = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        inputs = tokenizer(formatted, return_tensors="pt", truncation=True, max_length=128, return_token_type_ids=False).to(device)
+        batch_prompts = [prompt] * batch_size
+        formatted = [
+            tokenizer.apply_chat_template(
+                [{"role": "user", "content": item}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            for item in batch_prompts
+        ]
+        inputs = tokenizer(
+            formatted,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=128,
+            return_token_type_ids=False,
+        ).to(device)
 
         p_tokens = inputs["input_ids"].shape[1]
+        prompt_tokens = inputs["attention_mask"].sum().item()
 
+        if device.startswith("cuda"):
+            torch.cuda.synchronize(device)
         t0 = time.perf_counter()
         with torch.no_grad():
             gen = model.generate(
@@ -55,14 +74,17 @@ def evaluate_speed(model, tokenizer, device="cpu", max_new_tokens=128,
                 pad_token_id=tokenizer.pad_token_id,
                 eos_token_id=tokenizer.eos_token_id,
             )
+        if device.startswith("cuda"):
+            torch.cuda.synchronize(device)
         elapsed_ms = (time.perf_counter() - t0) * 1000.0
 
-        g_tokens = gen.shape[1] - p_tokens
+        per_sequence_tokens = gen.shape[1] - p_tokens
+        g_tokens = per_sequence_tokens * batch_size
 
         if run_idx >= warmup_runs:
             latencies_ms.append(elapsed_ms)
             total_gen_tokens += g_tokens
-            total_prompt_tokens += p_tokens
+            total_prompt_tokens += prompt_tokens
 
     peak_memory_mb = None
     if device.startswith("cuda"):
@@ -75,6 +97,7 @@ def evaluate_speed(model, tokenizer, device="cpu", max_new_tokens=128,
         peak_memory_mb=peak_memory_mb,
         device=device,
         dtype=str(model.dtype) if hasattr(model, "dtype") else "fp32",
+        batch_size=batch_size,
     )
 
 

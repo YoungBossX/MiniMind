@@ -19,7 +19,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 # 模型配置类
 from model.MiniMindModel import MiniMindConfig
 # 预训练数据集类
-from dataset.llm_dataset import PretrainDataset
+from dataset.llm_dataset import PretrainDataset, dynamic_padding_collate
 # 动态计算学习率（通常是 warmup + cosine decay）
 # 日志打印（只在主进程打印，避免多卡重复输出）
 # 判断当前进程是否是主进程（rank 0）
@@ -36,7 +36,10 @@ from trainer.trainer_utils import (
     init_distributed_mode,
     setup_seed,
     init_model,
-    SkipBatchSampler,
+    build_epoch_batch_sampler,
+    accumulation_window_size,
+    should_optimizer_step,
+    checkpoint_due,
 )
 from trainer.path_utils import resolve_project_paths
 
@@ -98,7 +101,10 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             
             # 梯度累积：把 loss 除以累积步数
             # 目的：模拟更大 batch_size，节省显存
-            loss = loss / args.accumulation_steps
+            accumulation_divisor = accumulation_window_size(
+                step, iters, args.accumulation_steps
+            )
+            loss = loss / accumulation_divisor
 
         # ── 反向传播 ──────────────────────────────────────────────────
         # scaler.scale(loss)：将 loss 乘以缩放因子（防止 float16 下梯度下溢）
@@ -106,7 +112,10 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
         scaler.scale(loss).backward()
 
         # ── 参数更新（每 accumulation_steps 步执行一次）───────────────
-        if step % args.accumulation_steps == 0 or step == iters:
+        did_optimizer_step = should_optimizer_step(
+            step, iters, args.accumulation_steps
+        )
+        if did_optimizer_step:
             # unscale_：将梯度除回缩放因子，还原真实梯度值
             # 必须在 clip_grad_norm_ 之前调用，否则裁剪的是放大后的梯度
             scaler.unscale_(optimizer)
@@ -135,7 +144,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             # 已用时间（秒）
             spend_time = time.time() - start_time
             # 恢复真实 loss（之前除以了 accumulation_steps）
-            current_loss = loss.item() * args.accumulation_steps
+            current_loss = loss.item() * accumulation_divisor
             # 当前实际学习率
             current_lr = optimizer.param_groups[-1]["lr"]
 
@@ -155,7 +164,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
                     {"loss": current_loss, "lr": current_lr, "epoch_Time": eta_min}
                 )
 
-        if (step % args.save_interval == 0 or step == iters) and is_main_process():
+        if did_optimizer_step and checkpoint_due(step, iters, args.accumulation_steps, args.save_interval) and is_main_process():
             model.eval() # 切换到评估模式
 
             # 构建保存文件路径
@@ -358,29 +367,24 @@ if __name__ == "__main__":
         if train_sampler:
             train_sampler.set_epoch(epoch)
 
+        skip = start_step if epoch == start_epoch and start_step > 0 else 0
+        batch_sampler = build_epoch_batch_sampler(
+            len(train_ds), args.batch_size, epoch, skip_batches=skip,
+            sampler=train_sampler, lengths=train_ds.lengths,
+        )
+        loader = DataLoader(
+            train_ds,
+            batch_sampler=batch_sampler,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            collate_fn=dynamic_padding_collate,
+        )
+
         # 📚 断点续训逻辑
-        if epoch == start_epoch and start_step > 0: # 第一个epoch且存在检查点
-            # 使用跳批采样器，跳过已训练的数据
-            batch_sampler = SkipBatchSampler(
-                train_sampler or range(len(train_ds)), args.batch_size, start_step
-            )
-            loader = DataLoader(
-                train_ds,
-                batch_sampler=batch_sampler,
-                num_workers=args.num_workers,
-                pin_memory=True,
-            )
+        if skip > 0:
             Logger(
                 f"Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始"
             )
             train_epoch(epoch, loader, len(loader) + start_step, start_step, wandb)
-        else:  # 默认从头开始
-            loader = DataLoader(
-                train_ds,
-                batch_size=args.batch_size,
-                shuffle=(train_sampler is None),
-                sampler=train_sampler,
-                num_workers=args.num_workers,
-                pin_memory=True,
-            )
+        else:
             train_epoch(epoch, loader, len(loader), 0, wandb)

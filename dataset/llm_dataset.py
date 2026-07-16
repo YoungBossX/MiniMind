@@ -8,6 +8,62 @@ from datasets import load_dataset
 # 禁用 HuggingFace tokenizer 的多进程并行，避免在 DataLoader 多进程环境中产生死锁
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+
+def _approximate_text_length(text):
+    """Cheap length signal used only to locally group offline training samples."""
+    return max(1, len(str(text)))
+
+
+def _approximate_conversation_length(conversations):
+    """Estimate ChatML size without rendering or tokenizing the conversation."""
+    return max(
+        1,
+        sum(
+            _approximate_text_length(turn.get("content", ""))
+            for turn in conversations
+            if isinstance(turn, dict)
+        ),
+    )
+
+
+def dynamic_padding_collate(batch):
+    """Trim right padding in fixed-shape offline-training samples before stacking.
+
+    Datasets keep their fixed-length ``__getitem__`` contract. This collate
+    function only removes columns that are padding for every sample in a batch.
+    """
+    first_sample = batch[0]
+    if isinstance(first_sample, tuple):
+        max_length = max(1, max(int(sample[3].sum().item()) for sample in batch))
+        return tuple(
+            torch.stack([sample[field_index][:max_length] for sample in batch])
+            for field_index in range(4)
+        )
+
+    if isinstance(first_sample, dict):
+        result = {}
+        for branch in ("chosen", "rejected"):
+            max_length = max(
+                1,
+                max(
+                    int(sample[f"attention_mask_{branch}"].sum().item())
+                    for sample in batch
+                ),
+            )
+            for field_name in (
+                f"x_{branch}",
+                f"y_{branch}",
+                f"mask_{branch}",
+                f"attention_mask_{branch}",
+            ):
+                result[field_name] = torch.stack(
+                    [sample[field_name][:max_length] for sample in batch]
+                )
+        return result
+
+    raise TypeError(f"Unsupported offline batch sample type: {type(first_sample)!r}")
+
+
 def pre_processing_chat(conversations, add_system_ratio=0.2):
     SYSTEM_PROMPTS = [
         "你是一个知识丰富的AI，尽力为用户提供准确的信息。",
@@ -48,6 +104,12 @@ class PretrainDataset(Dataset):
         self.tokenizer = tokenizer      # 分词器，用于将文本转为token ID
         self.max_length = max_length    # 每条样本的最大token长度
         self.samples = self.load_data(data_path)  # 加载数据
+        self.lengths = [
+            self._estimate_length(sample['text']) for sample in self.samples
+        ]
+
+    def _estimate_length(self, text):
+        return _approximate_text_length(text)
 
     def load_data(self, path):
         """从文件中加载数据，每一行为一条JSON格式的样本"""
@@ -118,6 +180,10 @@ class SFTDataset(Dataset):
         self.samples = self.load_data(jsonl_path)   # 加载数据样本
         self.bos_id = tokenizer('<|im_start|>assistant\n', add_special_tokens=False).input_ids # [1, 1078, 538, 501]， [1]是<|im_start|>这个特殊token的id，[1078, 538, 501]是assistant的分词id
         self.eos_id = tokenizer('<|im_end|>\n', add_special_tokens=False).input_ids # [2]
+        self.lengths = [
+            self._estimate_length(sample['conversations'])
+            for sample in self.samples
+        ]
 
     def __len__(self):
         return len(self.samples)  # 返回样本数量
@@ -158,6 +224,9 @@ class SFTDataset(Dataset):
             add_generation_prompt=False,
             tools=tools
         )
+
+    def _estimate_length(self, conversations):
+        return _approximate_conversation_length(conversations)
 
     def _generate_loss_mask(self, input_ids):
         """
@@ -243,9 +312,16 @@ class DPODataset(Dataset):
                 line = line.strip()
                 obj = json.loads(line)
                 self.data.append(obj)
+        self.lengths = [self._estimate_length(item) for item in self.data]
 
     def __len__(self):
         return len(self.data)
+
+    def _estimate_length(self, item):
+        return max(
+            _approximate_conversation_length(item[branch])
+            for branch in ('chosen', 'rejected')
+        )
 
     def __getitem__(self, index):
         item = self.data[index]
@@ -400,6 +476,16 @@ class RLAIFDataset(Dataset):
     
     def __getitem__(self, index):
         sample = self.data[index]
+
+        if isinstance(sample.get("prompt"), str) and sample["prompt"].strip():
+            messages = [{"role": "user", "content": sample["prompt"]}]
+            prompt = self.tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+            return {"prompt": prompt, "answer": sample.get("answer", "")}
+
         prompt, answer = self.create_chat_prompt(sample["conversations"])
 
         return {"prompt": prompt, "answer": answer}

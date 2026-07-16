@@ -29,6 +29,30 @@ def get_lr(current_step, total_steps, lr):
     progress = (current_step - warmup_steps) / max(total_steps - warmup_steps, 1)
     return lr * (0.1 + 0.45 * (1 + math.cos(math.pi * progress)))
 
+
+def accumulation_window_size(step, total_steps, accumulation_steps):
+    """Return the number of micro-batches in ``step``'s accumulation window."""
+    if accumulation_steps < 1:
+        raise ValueError("accumulation_steps must be at least 1")
+    if not 1 <= step <= total_steps:
+        raise ValueError("step must be within the current epoch")
+    window_start = ((step - 1) // accumulation_steps) * accumulation_steps + 1
+    return min(accumulation_steps, total_steps - window_start + 1)
+
+
+def should_optimizer_step(step, total_steps, accumulation_steps):
+    """Whether the current micro-batch closes an accumulation window."""
+    return step % accumulation_steps == 0 or step == total_steps
+
+
+def checkpoint_due(step, total_steps, accumulation_steps, save_interval):
+    """Save at the first completed accumulation window after each interval."""
+    if save_interval < 1:
+        raise ValueError("save_interval must be at least 1")
+    window_size = accumulation_window_size(step, total_steps, accumulation_steps)
+    previous_step = step - window_size
+    return step == total_steps or step // save_interval > previous_step // save_interval
+
 # 初始化分布式
 def init_distributed_mode():
     # 非DDP模式
@@ -156,7 +180,7 @@ def lm_checkpoint(
         if os.path.exists(resume_path):
             # map_location="cpu"：先加载到 CPU，避免 GPU 显存直接被占用
             # 后续训练循环会手动把参数移到对应设备
-            ckp_data = torch.load(resume_path, map_location="cpu")
+            ckp_data = torch.load(resume_path, map_location="cpu", weights_only=True)
             # ── 处理 GPU 数量变化的情况 ──────────────────────────────
             # 上次用 4 张卡训练，这次只有 2 张卡
             # 每张卡处理的数据量不同，step 编号需要换算
@@ -209,9 +233,9 @@ def init_model(
             f"{save_dir}/{from_weight}_{lm_config.hidden_size}{moe_suffix}.pth"
         )
 
-        weights = torch.load(weight_path, map_location=device)
+        weights = torch.load(weight_path, map_location=device, weights_only=True)
 
-        model.load_state_dict(weights, strict=False)
+        model.load_state_dict(weights, strict=True)
 
     total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     Logger(f"所加载Model可训练参数：{total_params / 1e6:.3f} 百万")
@@ -266,3 +290,82 @@ class SkipBatchSampler(Sampler):
         total_batches = (len(self.sampler) + self.batch_size - 1) // self.batch_size
 
         return max(0, total_batches - self.skip_batches)
+
+
+class LengthBucketBatchSampler(Sampler):
+    """Batch a deterministic index stream after sorting bounded local windows."""
+
+    def __init__(
+        self,
+        sampler,
+        batch_size,
+        lengths,
+        skip_batches=0,
+        bucket_window_multiplier=50,
+    ):
+        self.sampler = sampler
+        self.batch_size = batch_size
+        self.lengths = lengths
+        self.skip_batches = skip_batches
+        self.bucket_window_size = batch_size * max(1, bucket_window_multiplier)
+
+    def __iter__(self):
+        window = []
+        skipped = 0
+
+        for index in self.sampler:
+            window.append(index)
+            if len(window) < self.bucket_window_size:
+                continue
+
+            sorted_window = sorted(
+                window, key=lambda sample_index: self.lengths[sample_index]
+            )
+            for batch_start in range(0, len(sorted_window), self.batch_size):
+                batch = sorted_window[batch_start:batch_start + self.batch_size]
+                if skipped < self.skip_batches:
+                    skipped += 1
+                else:
+                    yield batch
+            window = []
+
+        if window:
+            sorted_window = sorted(
+                window, key=lambda sample_index: self.lengths[sample_index]
+            )
+            for batch_start in range(0, len(sorted_window), self.batch_size):
+                batch = sorted_window[batch_start:batch_start + self.batch_size]
+                if skipped < self.skip_batches:
+                    skipped += 1
+                else:
+                    yield batch
+
+    def __len__(self):
+        total_batches = (len(self.sampler) + self.batch_size - 1) // self.batch_size
+        return max(0, total_batches - self.skip_batches)
+
+
+def build_epoch_batch_sampler(
+    dataset_size,
+    batch_size,
+    epoch,
+    skip_batches=0,
+    sampler=None,
+    seed=42,
+    lengths=None,
+    bucket_window_multiplier=50,
+):
+    """Build one deterministic epoch batch stream for fresh and resumed training."""
+    if sampler is None:
+        generator = torch.Generator()
+        generator.manual_seed(seed + epoch)
+        sampler = torch.randperm(dataset_size, generator=generator).tolist()
+    if lengths is not None:
+        return LengthBucketBatchSampler(
+            sampler,
+            batch_size,
+            lengths,
+            skip_batches=skip_batches,
+            bucket_window_multiplier=bucket_window_multiplier,
+        )
+    return SkipBatchSampler(sampler, batch_size, skip_batches)

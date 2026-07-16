@@ -61,7 +61,7 @@ class CriticModel(MiniMindForCausalLM):
     
     def forward(self, input_ids=None, attention_mask=None, **kwargs):
         outputs = self.model(input_ids=input_ids, attention_mask=attention_mask, **kwargs)
-        hidden_states = self.model.norm(outputs[0])
+        hidden_states = outputs[0]
         # 通过 value_head 计算状态值
         values = self.value_head(hidden_states).squeeze(-1) # 形状为 (batch_size, seq_len)
         return values
@@ -349,7 +349,8 @@ def ppo_update(rollout, actor_model, critic_model, actor_optimizer, critic_optim
     returns = rollout['returns']
     old_values = rollout['old_values']
  
-    metrics = {}
+    metrics = None
+    completed_updates = 0
  
     for ppo_ep in range(args.ppo_epochs):
         # ================================================================
@@ -470,22 +471,43 @@ def ppo_update(rollout, actor_model, critic_model, actor_optimizer, critic_optim
             + args.kl_coef * kl_ref
             - args.entropy_coef * entropy  # entropy bonus (负号=最大化 entropy)
             + aux_loss
-        ) / args.accumulation_steps
+        )
  
         loss.backward()
- 
-    # 返回最后一轮的 metrics (用于日志)
-    metrics = {
-        'policy_loss': policy_loss.item(),
-        'value_loss': value_loss.item(),
-        'entropy': entropy.item(),
-        'kl_ref': kl_ref.item(),
-        'approx_kl': approx_kl.item(),
-        'clip_frac': clip_frac.item(),
-        'aux_loss': aux_loss.item(),
-        'reward': rollout['rewards'].mean().item(),
-        'ppo_epochs_actual': ppo_ep + 1,
-    }
+        clip_grad_norm_(actor_model.parameters(), args.grad_clip)
+        clip_grad_norm_(critic_model.parameters(), args.grad_clip)
+        actor_optimizer.step()
+        critic_optimizer.step()
+        actor_scheduler.step()
+        critic_scheduler.step()
+        actor_optimizer.zero_grad()
+        critic_optimizer.zero_grad()
+        completed_updates += 1
+        metrics = {
+            'policy_loss': policy_loss.item(),
+            'value_loss': value_loss.item(),
+            'entropy': entropy.item(),
+            'kl_ref': kl_ref.item(),
+            'approx_kl': approx_kl.item(),
+            'clip_frac': clip_frac.item(),
+            'aux_loss': aux_loss.item(),
+            'reward': rollout['rewards'].mean().item(),
+        }
+
+    if metrics is None:
+        # This only occurs when ppo_epochs is zero; no forward-pass metrics
+        # are reported as if they represented an applied optimizer update.
+        metrics = {
+            'policy_loss': float('nan'),
+            'value_loss': float('nan'),
+            'entropy': float('nan'),
+            'kl_ref': float('nan'),
+            'approx_kl': float('nan'),
+            'clip_frac': float('nan'),
+            'aux_loss': float('nan'),
+            'reward': rollout['rewards'].mean().item(),
+        }
+    metrics['ppo_epochs_actual'] = completed_updates
  
     return metrics
 
@@ -501,10 +523,9 @@ def ppo_train_epoch(epoch, loader, iters, ref_model,
     每个 step 的流程:
     1. collect_rollout: Actor 生成回答, 收集所有数据
     2. ppo_update:      用 PPO 算法更新 Actor 和 Critic (K 轮)
-    3. 梯度步:          应用梯度 (可能有梯度累积)
-    4. 日志:            记录训练指标
-    5. 同步 Old Actor:  定期把当前 Actor 的参数复制给 Old Actor
-    6. 保存 checkpoint: 定期保存模型
+    3. 日志:            记录训练指标
+    4. 同步 Old Actor:  定期把当前 Actor 的参数复制给 Old Actor
+    5. 保存 checkpoint: 定期保存模型
     """
     actor_model.train()
     critic_model.train()
@@ -530,19 +551,7 @@ def ppo_train_epoch(epoch, loader, iters, ref_model,
             tokenizer, args, autocast_ctx, lm_config
         )
  
-        # ---- Step 3: 应用梯度 ----
-        # 如果使用梯度累积 (accumulation_steps > 1), 等累积够了再 step
-        if step % args.accumulation_steps == 0 or step == iters:
-            clip_grad_norm_(actor_model.parameters(), args.grad_clip)
-            clip_grad_norm_(critic_model.parameters(), args.grad_clip)
-            actor_optimizer.step()
-            critic_optimizer.step()
-            actor_scheduler.step()
-            critic_scheduler.step()
-            actor_optimizer.zero_grad()
-            critic_optimizer.zero_grad()
- 
-        # ---- Step 4: 日志 ----
+        # ---- Step 3: 日志 ----
         if is_main_process():
             # 统计生成 response 的平均长度 (监控 reward hacking: 长度暴涨可能有问题)
             gen_out = rollout['gen_out']
@@ -584,7 +593,7 @@ def ppo_train_epoch(epoch, loader, iters, ref_model,
                     f"AvgLen:{avg_len:.1f}, aLR:{actor_lr:.2e}, cLR:{critic_lr:.2e}"
                 )
  
-        # ---- Step 5: 保存 checkpoint ----
+        # ---- Step 4: 保存 checkpoint ----
         if (step % args.save_interval == 0 or step == iters) and is_main_process():
             actor_model.eval()
             moe_suffix = '_moe' if lm_config.use_moe else ''
@@ -651,6 +660,12 @@ if __name__ == "__main__":
     parser.add_argument("--use_compile", default=0, type=int, choices=[0, 1])
     args = parser.parse_args()
     args = resolve_project_paths(args, "save_dir", "data_path", "reward_model_path")
+    if args.ppo_epochs < 1:
+        raise ValueError("PPO requires --ppo_epochs to be at least 1.")
+    if args.accumulation_steps != 1:
+        raise ValueError(
+            "PPO requires --accumulation_steps=1 because each PPO epoch performs an optimizer step."
+        )
  
     # ========== 1. 初始化环境 ==========
     local_rank = init_distributed_mode()
@@ -710,7 +725,7 @@ if __name__ == "__main__":
     # Critic (从同样的 base weight 初始化, value_head 随机初始化)
     moe_suffix = '_moe' if lm_config.use_moe else ''
     ckp = f'{args.save_dir}/{base_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
-    state_dict = torch.load(ckp, map_location=args.device)
+    state_dict = torch.load(ckp, map_location=args.device, weights_only=True)
     critic_model = CriticModel(lm_config)
     critic_model.load_state_dict(state_dict, strict=False)
     critic_model = critic_model.to(args.device)
@@ -729,7 +744,7 @@ if __name__ == "__main__":
  
     loader_for_count = DataLoader(train_ds, batch_size=args.batch_size, sampler=train_sampler)
     iters = len(loader_for_count)
-    total_optimizer_steps = ((iters + args.accumulation_steps - 1) // args.accumulation_steps) * args.epochs
+    total_optimizer_steps = iters * args.ppo_epochs * args.epochs
     actor_scheduler = CosineAnnealingLR(actor_optimizer, T_max=total_optimizer_steps, eta_min=args.learning_rate / 10)
     critic_scheduler = CosineAnnealingLR(critic_optimizer, T_max=total_optimizer_steps, eta_min=args.critic_learning_rate / 10)
  

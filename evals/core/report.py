@@ -13,6 +13,7 @@ def generate_markdown_report(
     dtype: str = "fp32",
     seed: int = 42,
     failed_samples: dict = None,
+    stage_status: dict = None,
 ) -> str:
     """生成 eval_report.md
 
@@ -45,6 +46,17 @@ def generate_markdown_report(
         f"| Evaluation Time | {timestamp} |",
         "",
     ]
+
+    if stage_status is not None:
+        lines += [
+            "## Evaluation Status",
+            "",
+            "| Stage | Status |",
+            "|-------|--------|",
+        ]
+        for stage, status in stage_status.items():
+            lines.append(f"| {stage} | {status} |")
+        lines.append("")
 
     def _add_metric_section(title, metrics_dict, indent_level=2):
         nonlocal lines

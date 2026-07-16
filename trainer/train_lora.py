@@ -12,8 +12,12 @@ from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from model.MiniMindModel import MiniMindConfig
 from model.model_lora import save_lora, apply_lora
-from dataset.llm_dataset import SFTDataset
-from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler
+from dataset.llm_dataset import SFTDataset, dynamic_padding_collate
+from trainer.trainer_utils import (get_lr, Logger, is_main_process, lm_checkpoint,
+                                   init_distributed_mode, setup_seed, init_model,
+                                   accumulation_window_size,
+                                   should_optimizer_step, checkpoint_due,
+                                   build_epoch_batch_sampler)
 from trainer.path_utils import resolve_project_paths
 
 warnings.filterwarnings('ignore')
@@ -43,7 +47,10 @@ def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
         # CPU上 → 什么都不做，正常执行
         with autocast_ctx:
             res = model(input_ids, attention_mask=attention_mask, labels=labels, loss_mask=loss_mask)
-            loss = (res.loss + res.aux_loss) / args.accumulation_steps
+            accumulation_divisor = accumulation_window_size(
+                step, iters, args.accumulation_steps
+            )
+            loss = (res.loss + res.aux_loss) / accumulation_divisor
 
         # scaler.scale(loss): 放大损失值，防止float16下的梯度下溢
         # .backward(): 计算梯度，填充到各参数的.grad属性
@@ -51,7 +58,10 @@ def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
 
         # scaler.unscale_(optimizer): 将放大的梯度恢复到真实值
         # 必须在梯度裁剪之前调用
-        if step % args.accumulation_steps == 0 or step == iters:
+        did_optimizer_step = should_optimizer_step(
+            step, iters, args.accumulation_steps
+        )
+        if did_optimizer_step:
             # 梯度反缩放，必须在梯度裁剪之前调用
             scaler.unscale_(optimizer)
 
@@ -74,7 +84,7 @@ def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
             spend_time = time.time() - start_time
             # 将单元素张量转换为Python标量
             # 必须恢复梯度累积的缩放：乘以accumulation_steps
-            current_loss = loss.item() * args.accumulation_steps
+            current_loss = loss.item() * accumulation_divisor
             # 获取当前学习率
             current_lr = optimizer.param_groups[-1]["lr"]
 
@@ -93,7 +103,7 @@ def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
 
         # 每save_interval步或最后一步保存一次
         # is_main_process(): 只有主进程保存，避免多进程重复写入
-        if (step % args.save_interval == 0 or step == iters) and is_main_process():
+        if did_optimizer_step and checkpoint_due(step, iters, args.accumulation_steps, args.save_interval) and is_main_process():
             model.eval() 
             # 只保存LoRA的A和B矩阵，不保存整个模型
             lora_save_path = (f"{args.save_dir}/{args.lora_name}_{lm_config.hidden_size}.pth")
@@ -370,19 +380,20 @@ if __name__ == "__main__":
         # set_epoch(): 确保分布式采样器的随机性
         train_sampler and train_sampler.set_epoch(epoch)
         
+        skip = start_step if epoch == start_epoch and start_step > 0 else 0
+        batch_sampler = build_epoch_batch_sampler(
+            len(train_ds), args.batch_size, epoch, skip_batches=skip,
+            sampler=train_sampler, lengths=train_ds.lengths,
+        )
+        loader = DataLoader(
+            train_ds, batch_sampler=batch_sampler,
+            num_workers=args.num_workers, pin_memory=True,
+            collate_fn=dynamic_padding_collate,
+        )
+
         # 第一个epoch且存在检查点
-        if epoch == start_epoch and start_step > 0:
-            # 📚 跳过已完成的step
-            # SkipBatchSampler: 自定义采样器，跳过前N个batch
-            # 用于断点续训时从指定step开始
-            batch_sampler = SkipBatchSampler(train_sampler or range(len(train_ds)), args.batch_size, start_step)
-            loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True)
+        if skip > 0:
             Logger(f"Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始")
-            train_epoch(epoch, loader, len(loader), lora_params, start_step=start_step, wandb=wandb)
+            train_epoch(epoch, loader, len(loader) + start_step, lora_params, start_step=start_step, wandb=wandb)
         else:
-            # 📚 默认从头开始
-            # 标准数据加载器
-            # DataLoader: PyTorch的数据加载器
-            # shuffle: 单GPU时随机打乱，多GPU时由sampler控制
-            loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=(train_sampler is None), sampler=train_sampler, num_workers=args.num_workers, pin_memory=True)
             train_epoch(epoch, loader, len(loader), lora_params, 0, wandb)

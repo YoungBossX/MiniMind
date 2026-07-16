@@ -8,6 +8,11 @@
 """
 import os
 import sys
+import shutil
+import tempfile
+import threading
+import importlib
+from contextlib import contextmanager
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import argparse
@@ -26,6 +31,77 @@ warnings.filterwarnings("ignore")
 SMOKE_STEPS = 50
 REPORT_DIR = os.path.join(os.path.dirname(__file__), "reports")
 SAVE_DIR = os.path.join(os.path.dirname(os.path.dirname(__file__)), "out")
+HF_MODULES_CACHE_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".tmp")
+HF_MODULES_CACHE_LOCK = threading.RLock()
+
+
+@contextmanager
+def temporary_hf_modules_cache():
+    """Keep PPO reward-model remote-code modules inside the smoke-test workspace."""
+    from transformers import dynamic_module_utils
+
+    with HF_MODULES_CACHE_LOCK:
+        os.makedirs(HF_MODULES_CACHE_ROOT, exist_ok=True)
+        cache_dir = tempfile.mkdtemp(
+            prefix="huggingface_modules_", dir=HF_MODULES_CACHE_ROOT
+        )
+        previous_cache = dynamic_module_utils.HF_MODULES_CACHE
+        existing_cache_path_entries = sys.path.count(cache_dir)
+        body_error = None
+        dynamic_module_utils.HF_MODULES_CACHE = cache_dir
+        try:
+            yield cache_dir
+        except BaseException as error:
+            body_error = error
+            raise
+        finally:
+            cleanup_errors = []
+
+            try:
+                dynamic_module_utils.HF_MODULES_CACHE = previous_cache
+            except BaseException as error:
+                cleanup_errors.append(error)
+
+            try:
+                for _ in range(max(0, sys.path.count(cache_dir) - existing_cache_path_entries)):
+                    sys.path.remove(cache_dir)
+            except BaseException as error:
+                cleanup_errors.append(error)
+
+            try:
+                shutil.rmtree(cache_dir)
+            except BaseException as error:
+                cleanup_errors.append(error)
+
+            try:
+                importlib.invalidate_caches()
+            except BaseException as error:
+                cleanup_errors.append(error)
+
+            if cleanup_errors:
+                cleanup_error = cleanup_errors[0]
+                if body_error is None:
+                    raise cleanup_error
+                cleanup_message = (
+                    "Failed to clean up PPO Hugging Face module cache; "
+                    f"preserving the active exception: {cleanup_error}"
+                )
+                print(f"[WARN] {cleanup_message}", file=sys.stderr)
+                warnings.warn(cleanup_message, RuntimeWarning, stacklevel=2)
+
+
+def load_ppo_reward_components(reward_path, device):
+    """Load PPO's local reward components without writing remote code to user cache."""
+    from transformers import AutoTokenizer, AutoModel
+
+    with temporary_hf_modules_cache():
+        reward_model = AutoModel.from_pretrained(
+            reward_path, trust_remote_code=True, torch_dtype=torch.float16
+        ).to(device).eval()
+        reward_tokenizer = AutoTokenizer.from_pretrained(
+            reward_path, trust_remote_code=True
+        )
+    return reward_model, reward_tokenizer
 
 
 def assertion(name, passed, detail=""):
@@ -453,7 +529,6 @@ def smoke_ppo(device, use_swanlab=False):
             assertion("ppo_skipped_no_rm", True),
         ], use_swanlab)
 
-    from transformers import AutoTokenizer, AutoModel
     from trainer.trainer_utils import init_model
     from trainer.train_ppo import CriticModel, compute_gae
 
@@ -480,8 +555,7 @@ def smoke_ppo(device, use_swanlab=False):
         pass
 
     # Reward
-    reward_model = AutoModel.from_pretrained(reward_path, trust_remote_code=True, torch_dtype=torch.float16).to(device).eval()
-    reward_tokenizer = AutoTokenizer.from_pretrained(reward_path, trust_remote_code=True)
+    reward_model, reward_tokenizer = load_ppo_reward_components(reward_path, device)
     for p in reward_model.parameters():
         p.requires_grad_(False)
 

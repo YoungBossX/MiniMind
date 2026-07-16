@@ -50,7 +50,7 @@ def apply_lora(model, rank, alpha, target_modules):
 
 def load_lora(model, path):
     device = next(model.parameters()).device
-    state_dict = torch.load(path, map_location=device)
+    state_dict = torch.load(path, map_location=device, weights_only=True)
     state_dict = {(k[7:] if k.startswith('module.') else k): v for k, v in state_dict.items()}
 
     for name, module in model.named_modules():

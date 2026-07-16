@@ -172,12 +172,17 @@ def apply_rotary_pos_emb(q, k, cos, sin, position_ids=None, unsqueeze_dim=1):
         )
 
     # 2. 对 q 和 k 应用 RoPE 旋转公式
-    q_embed = (q * cos.unsqueeze(unsqueeze_dim)) + (
-        rotate_half(q) * sin.unsqueeze(unsqueeze_dim)
-    )
-    k_embed = (k * cos.unsqueeze(unsqueeze_dim)) + (
-        rotate_half(k) * sin.unsqueeze(unsqueeze_dim)
-    )
+    if position_ids is not None:
+        cos = cos[position_ids]
+        sin = sin[position_ids]
+        cos = cos.unsqueeze(2)
+        sin = sin.unsqueeze(2)
+    else:
+        cos = cos.unsqueeze(unsqueeze_dim)
+        sin = sin.unsqueeze(unsqueeze_dim)
+
+    q_embed = (q * cos) + (rotate_half(q) * sin)
+    k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
 
 def repeat_kv(x: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -235,6 +240,7 @@ class Attention(nn.Module):
             past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
             use_cache=False,
             attention_mask: Optional[torch.Tensor] = None,
+            position_ids: Optional[torch.Tensor] = None,
         ):
         # 1. 获取输入的 batch_size 和 seq_len
         batch_size, seq_len, _ = x.size()
@@ -248,7 +254,9 @@ class Attention(nn.Module):
         xv = xv.view(batch_size, seq_len, self.num_key_value_heads, self.head_dim)
         # 4. 应用 RoPE 位置编码
         cos, sin = position_embeddings
-        xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin)
+        xq, xk = apply_rotary_pos_emb(
+            xq, xk, cos, sin, position_ids=position_ids
+        )
         # 5. kv_cache 处理：如果提供了 past_key_value，则将新的 k 和 v 与缓存中的 k 和 v 进行拼接
         # xk 和 xv 的形状在拼接前是 (batch_size, seq_len, num_key_value_heads, head_dim)，拼接后是 (batch_size, seq_len_kv, num_key_value_heads, head_dim)，其中 seq_len_kv = seq_len + past_seq_len
         if past_key_value is not None:
@@ -661,6 +669,7 @@ class MiniMindBlock(nn.Module):
         past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
         use_cache=False,
         attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
     ):
         # 1. 注意力子层（Pre-Norm + 残差）
         res = hidden_states
@@ -670,6 +679,7 @@ class MiniMindBlock(nn.Module):
             past_key_value,
             use_cache,
             attention_mask,
+            position_ids,
         )
         hidden_states = res + hidden_states
 
@@ -705,6 +715,7 @@ class MiniMindModel(nn.Module):
         self,
         input_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
         past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
         use_cache: bool = False,
         **kwargs,
@@ -730,10 +741,21 @@ class MiniMindModel(nn.Module):
             self.embed_tokens(input_ids)
         )
 
-        position_embeddings = (
-            self.freqs_cos[start_pos : start_pos + seq_length],
-            self.freqs_sin[start_pos : start_pos + seq_length],
-        )
+        if position_ids is None:
+            if attention_mask is None:
+                position_ids = torch.arange(
+                    start_pos,
+                    start_pos + seq_length,
+                    device=input_ids.device,
+                ).unsqueeze(0).expand(batch_size, -1)
+            else:
+                position_ids = attention_mask.long().cumsum(-1) - 1
+                position_ids.masked_fill_(attention_mask == 0, 0)
+                position_ids = position_ids[:, -seq_length:]
+        else:
+            position_ids = position_ids[:, -seq_length:].to(input_ids.device)
+
+        position_embeddings = (self.freqs_cos, self.freqs_sin)
         
         presents = []
         for layer_idx, (block_layer, past_key_value) in enumerate(
@@ -745,6 +767,7 @@ class MiniMindModel(nn.Module):
                 past_key_value=past_key_value,
                 use_cache=use_cache,
                 attention_mask=attention_mask,
+                position_ids=position_ids,
             )
             presents.append(present)
 
@@ -779,6 +802,7 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
         self,
         input_ids: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
         loss_mask: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
         past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
@@ -795,6 +819,7 @@ class MiniMindForCausalLM(PreTrainedModel, GenerationMixin):
         hidden_states, past_key_values, aux_loss = self.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            position_ids=position_ids,
             past_key_values=past_key_values,
             use_cache=use_cache,
             **args,

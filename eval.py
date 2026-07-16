@@ -41,7 +41,7 @@ def init_model(args):
         ckp = save_dir / f"{args.weight}_{args.hidden_size}{moe_suffix}.pth"
         
         model.load_state_dict(
-            torch.load(ckp, map_location=args.device), strict=True
+            torch.load(ckp, map_location=args.device, weights_only=True), strict=True
         )
 
         if args.lora_weight != "None":
@@ -56,7 +56,7 @@ def init_model(args):
 
     else:
         model = AutoModelForCausalLM.from_pretrained(
-            args.load_from, trust_remote_code=True
+            args.load_from, trust_remote_code=args.trust_remote_code
         )
     print(
         f"MiniMind模型参数: {sum(p.numel() for p in model.parameters()) / 1e6:.2f} M(illion)"
@@ -73,6 +73,11 @@ def main():
         default="model",
         type=str,
         help="模型加载路径（model=原生torch权重，其他路径=transformers格式）",
+    )
+    parser.add_argument(
+        "--trust_remote_code",
+        action="store_true",
+        help="允许执行外部 Hugging Face 模型仓库提供的 Python 代码",
     )
     parser.add_argument(
         "--save_dir", 

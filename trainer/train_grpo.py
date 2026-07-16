@@ -18,7 +18,8 @@ from model.MiniMindModel import MiniMindConfig, MiniMindForCausalLM
 from dataset.llm_dataset import RLAIFDataset
 from trainer.trainer_utils import (
     Logger, is_main_process, lm_checkpoint,
-    init_distributed_mode, setup_seed, SkipBatchSampler, init_model
+    init_distributed_mode, setup_seed, SkipBatchSampler, init_model,
+    accumulation_window_size, should_optimizer_step, checkpoint_due
 )
 from trainer.path_utils import resolve_project_paths
  
@@ -27,7 +28,7 @@ warnings.filterwarnings('ignore')
 # ==========================================================================
 #  Per-token log-prob 计算 
 # ==========================================================================
-def get_per_token_logps(mdl, input_ids, num_completion_tokens):
+def get_per_token_logps(mdl, input_ids, num_completion_tokens, attention_mask):
     """
     计算 completion 部分每个 token 的 log-probability.
     
@@ -39,7 +40,11 @@ def get_per_token_logps(mdl, input_ids, num_completion_tokens):
         per_token_logps: [B*G, R] 每个 response token 的 log-prob
     """
     ids = input_ids.detach().clone()
-    logits = mdl(ids, logits_to_keep=num_completion_tokens + 1).logits
+    logits = mdl(
+        ids,
+        attention_mask=attention_mask,
+        logits_to_keep=num_completion_tokens + 1,
+    ).logits
     logits = logits[:, :-1, :]
     completion_ids = ids[:, -num_completion_tokens:]
     log_probs = F.log_softmax(logits, dim=-1)
@@ -140,13 +145,18 @@ def grpo_train_epoch(epoch, loader, iters, ref_model, reward_model, reward_token
  
         # ---- 3. 计算 actor 和 ref 的 per-token log-prob ----
         with autocast_ctx:
-            actor_logps, entropy_per_token = get_per_token_logps(model, outputs, R)
+            full_attention_mask = (outputs != tokenizer.pad_token_id).long()
+            actor_logps, entropy_per_token = get_per_token_logps(
+                model, outputs, R, full_attention_mask
+            )
             old_logps = actor_logps.detach()
-            res = model(outputs) if lm_config.use_moe else None
+            res = model(outputs, attention_mask=full_attention_mask) if lm_config.use_moe else None
             aux_loss = res.aux_loss if res is not None else torch.tensor(0.0, device=args.device)
  
         with torch.no_grad():
-            ref_logps, _ = get_per_token_logps(ref_model, outputs, R)  # [B*G, R]
+            ref_logps, _ = get_per_token_logps(
+                ref_model, outputs, R, full_attention_mask
+            )  # [B*G, R]
  
         # ---- 4. 计算 reward 和 advantage ----
         completions = tokenizer.batch_decode(completion_ids, skip_special_tokens=True)
@@ -197,11 +207,17 @@ def grpo_train_epoch(epoch, loader, iters, ref_model, reward_model, reward_token
         policy_loss = (per_token_loss * completion_mask).sum(dim=1) / seq_lengths
         policy_loss = policy_loss.mean()
  
-        loss = (policy_loss - args.entropy_coef * entropy + aux_loss) / args.accumulation_steps
+        accumulation_divisor = accumulation_window_size(
+            step, iters, args.accumulation_steps
+        )
+        loss = (policy_loss - args.entropy_coef * entropy + aux_loss) / accumulation_divisor
         loss.backward()
  
         # ---- 8. 梯度步 ----
-        if step % args.accumulation_steps == 0 or step == iters:
+        did_optimizer_step = should_optimizer_step(
+            step, iters, args.accumulation_steps
+        )
+        if did_optimizer_step:
             if args.grad_clip > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step()
@@ -242,7 +258,7 @@ def grpo_train_epoch(epoch, loader, iters, ref_model, reward_model, reward_token
                 })
  
         # ---- 10. 保存 ----
-        if (step % args.save_interval == 0 or step == iters) and is_main_process():
+        if did_optimizer_step and checkpoint_due(step, iters, args.accumulation_steps, args.save_interval) and is_main_process():
             model.eval()
             moe_suffix = '_moe' if lm_config.use_moe else ''
             ckp = f'{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth'

@@ -13,8 +13,12 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from model.MiniMindModel import MiniMindConfig
-from dataset.llm_dataset import DPODataset
-from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler
+from dataset.llm_dataset import DPODataset, dynamic_padding_collate
+from trainer.trainer_utils import (get_lr, Logger, is_main_process, lm_checkpoint,
+                                   init_distributed_mode, setup_seed, init_model,
+                                   accumulation_window_size,
+                                   should_optimizer_step, checkpoint_due,
+                                   build_epoch_batch_sampler)
 from trainer.path_utils import resolve_project_paths
 
 warnings.filterwarnings('ignore')
@@ -137,6 +141,40 @@ def dpo_loss(ref_log_probs, policy_log_probs, mask, beta, logprob_reduction="mea
     # .mean() 对应公式中的期望 E[...]
     return loss.mean()
 
+
+def align_dpo_branches_for_forward(
+    x_chosen,
+    y_chosen,
+    mask_chosen,
+    attention_mask_chosen,
+    x_rejected,
+    y_rejected,
+    mask_rejected,
+    attention_mask_rejected,
+):
+    """Right-pad independently cropped DPO branches just before one joint forward."""
+    target_length = max(x_chosen.size(1), x_rejected.size(1))
+
+    def pad_to_target(tensor):
+        padding = target_length - tensor.size(1)
+        return F.pad(tensor, (0, padding)) if padding else tensor
+
+    x_chosen, y_chosen, mask_chosen, attention_mask_chosen = (
+        pad_to_target(tensor)
+        for tensor in (x_chosen, y_chosen, mask_chosen, attention_mask_chosen)
+    )
+    x_rejected, y_rejected, mask_rejected, attention_mask_rejected = (
+        pad_to_target(tensor)
+        for tensor in (x_rejected, y_rejected, mask_rejected, attention_mask_rejected)
+    )
+    return (
+        torch.cat([x_chosen, x_rejected], dim=0),
+        torch.cat([y_chosen, y_rejected], dim=0),
+        torch.cat([mask_chosen, mask_rejected], dim=0),
+        torch.cat([attention_mask_chosen, attention_mask_rejected], dim=0),
+    )
+
+
 def train_epoch(epoch, loader, iters, ref_model, lm_config, start_step=0, wandb=None, beta=None):
     """
     DPO 训练一个 epoch。
@@ -167,10 +205,16 @@ def train_epoch(epoch, loader, iters, ref_model, lm_config, start_step=0, wandb=
 
         # ── 合并 chosen 和 rejected，一次前向传播处理两种数据 ────────
         # 前一半是 chosen，后一半是 rejected
-        x = torch.cat([x_chosen, x_rejected],   dim=0)  # [B, seq_len]
-        y = torch.cat([y_chosen, y_rejected],   dim=0)  # [B, seq_len]
-        mask = torch.cat([mask_chosen, mask_rejected], dim=0)  # [B, seq_len]
-        attention_mask = torch.cat([attention_mask_chosen, attention_mask_rejected], dim=0)  # [B, seq_len]
+        x, y, mask, attention_mask = align_dpo_branches_for_forward(
+            x_chosen,
+            y_chosen,
+            mask_chosen,
+            attention_mask_chosen,
+            x_rejected,
+            y_rejected,
+            mask_rejected,
+            attention_mask_rejected,
+        )
 
         # ── 动态学习率调整 ────────────────────────────────────────────
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
@@ -207,13 +251,19 @@ def train_epoch(epoch, loader, iters, ref_model, lm_config, start_step=0, wandb=
             loss = dpo_loss_val + outputs.aux_loss
  
             # 梯度累积：把 loss 除以累积步数，等效于更大的 batch
-            loss = loss / args.accumulation_steps
+            accumulation_divisor = accumulation_window_size(
+                step, iters, args.accumulation_steps
+            )
+            loss = loss / accumulation_divisor
  
         # ── 反向传播 ──────────────────────────────────────────────────
         scaler.scale(loss).backward()
 
         # ── 梯度累积满足条件时更新参数 ───────────────────────────────
-        if step % args.accumulation_steps == 0 or step == iters:
+        did_optimizer_step = should_optimizer_step(
+            step, iters, args.accumulation_steps
+        )
+        if did_optimizer_step:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             scaler.step(optimizer)
@@ -223,7 +273,7 @@ def train_epoch(epoch, loader, iters, ref_model, lm_config, start_step=0, wandb=
         # ── 训练日志 ──────────────────────────────────────────────────
         if step % args.log_interval == 0 or step == iters:
             spend_time   = time.time() - start_time
-            current_loss = loss.item() * args.accumulation_steps
+            current_loss = loss.item() * accumulation_divisor
             current_lr   = optimizer.param_groups[-1]["lr"]
             # ETA 估算：平均每步耗时 × 剩余步数
             eta_min = spend_time / local_step * (iters - step) // 60
@@ -234,7 +284,7 @@ def train_epoch(epoch, loader, iters, ref_model, lm_config, start_step=0, wandb=
                 wandb.log({"loss": current_loss, "lr": current_lr, "epoch_Time": eta_min})
 
         # ── 模型保存 ──────────────────────────────────────────────────
-        if (step % args.save_interval == 0 or step == iters) and is_main_process():
+        if did_optimizer_step and checkpoint_due(step, iters, args.accumulation_steps, args.save_interval) and is_main_process():
             model.eval()
             moe_suffix = "_moe" if lm_config.use_moe else ""
             ckp = f"{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth"
@@ -463,19 +513,20 @@ if __name__ == "__main__":
         # set_epoch(): 确保分布式采样器的随机性
         train_sampler and train_sampler.set_epoch(epoch)
         
+        skip = start_step if epoch == start_epoch and start_step > 0 else 0
+        batch_sampler = build_epoch_batch_sampler(
+            len(train_ds), args.batch_size, epoch, skip_batches=skip,
+            sampler=train_sampler, lengths=train_ds.lengths,
+        )
+        loader = DataLoader(
+            train_ds, batch_sampler=batch_sampler,
+            num_workers=args.num_workers, pin_memory=True,
+            collate_fn=dynamic_padding_collate,
+        )
+
         # 第一个epoch且存在检查点
-        if epoch == start_epoch and start_step > 0:
-            # 📚 跳过已完成的step
-            # SkipBatchSampler: 自定义采样器，跳过前N个batch
-            # 用于断点续训时从指定step开始
-            batch_sampler = SkipBatchSampler(train_sampler or range(len(train_ds)), args.batch_size, start_step)
-            loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True)
+        if skip > 0:
             Logger(f"Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}个step，从step {start_step + 1}开始")
             train_epoch(epoch, loader, len(loader) + start_step, ref_model, lm_config, start_step, wandb, args.beta)
         else:
-            # 📚 默认从头开始
-            # 标准数据加载器
-            # DataLoader: PyTorch的数据加载器
-            # shuffle: 单GPU时随机打乱，多GPU时由sampler控制
-            loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=(train_sampler is None), sampler=train_sampler, num_workers=args.num_workers, pin_memory=True)
             train_epoch(epoch, loader, len(loader), ref_model, lm_config, 0, wandb, args.beta)

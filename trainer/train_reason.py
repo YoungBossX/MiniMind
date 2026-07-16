@@ -29,10 +29,11 @@ from torch import optim, nn
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
 from model.MiniMindModel import MiniMindConfig
-from dataset.llm_dataset import SFTDataset
+from dataset.llm_dataset import SFTDataset, dynamic_padding_collate
 from trainer.trainer_utils import (
     get_lr, Logger, is_main_process, lm_checkpoint,
-    init_distributed_mode, setup_seed, init_model, SkipBatchSampler
+    init_distributed_mode, setup_seed, init_model, build_epoch_batch_sampler,
+    accumulation_window_size, should_optimizer_step, checkpoint_due
 )
 from trainer.path_utils import resolve_project_paths
 
@@ -132,12 +133,18 @@ def train_epoch(epoch, loader, iters, lm_config, tag_id_seqs,
             logits_loss = (loss_raw * weighted_mask).sum() / (valid_token_count + 1e-8)
  
             loss = logits_loss + res.aux_loss
-            loss = loss / args.accumulation_steps
+            accumulation_divisor = accumulation_window_size(
+                step, iters, args.accumulation_steps
+            )
+            loss = loss / accumulation_divisor
  
         # ---- Backward ----
         scaler.scale(loss).backward()
  
-        if step % args.accumulation_steps == 0 or step == iters:
+        did_optimizer_step = should_optimizer_step(
+            step, iters, args.accumulation_steps
+        )
+        if did_optimizer_step:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             scaler.step(optimizer)
@@ -147,7 +154,7 @@ def train_epoch(epoch, loader, iters, lm_config, tag_id_seqs,
         # ---- 日志 ----
         if step % args.log_interval == 0 or step == iters:
             spend_time = time.time() - start_time
-            current_loss = loss.item() * args.accumulation_steps
+            current_loss = loss.item() * accumulation_divisor
             current_aux_loss = res.aux_loss.item() if res.aux_loss is not None else 0.0
             current_logits_loss = logits_loss.item()
             current_lr = optimizer.param_groups[-1]['lr']
@@ -171,7 +178,7 @@ def train_epoch(epoch, loader, iters, lm_config, tag_id_seqs,
                 })
  
         # ---- 保存 checkpoint ----
-        if (step % args.save_interval == 0 or step == iters) and is_main_process():
+        if did_optimizer_step and checkpoint_due(step, iters, args.accumulation_steps, args.save_interval) and is_main_process():
             model.eval()
             moe_suffix = '_moe' if lm_config.use_moe else ''
             ckp = f'{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
@@ -289,11 +296,14 @@ if __name__ == "__main__":
     for epoch in range(start_epoch, args.epochs):
         train_sampler and train_sampler.set_epoch(epoch)
         setup_seed(42 + epoch)
-        indices = torch.randperm(len(train_ds)).tolist()
         skip = start_step if (epoch == start_epoch and start_step > 0) else 0
-        batch_sampler = SkipBatchSampler(train_sampler or indices, args.batch_size, skip)
+        batch_sampler = build_epoch_batch_sampler(
+            len(train_ds), args.batch_size, epoch, skip_batches=skip,
+            sampler=train_sampler, lengths=train_ds.lengths,
+        )
         loader = DataLoader(train_ds, batch_sampler=batch_sampler,
-                            num_workers=args.num_workers, pin_memory=True)
+                            num_workers=args.num_workers, pin_memory=True,
+                            collate_fn=dynamic_padding_collate)
         if skip > 0:
             Logger(f'Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}步, 从 step {start_step + 1} 开始')
             train_epoch(epoch, loader, len(loader) + skip, lm_config,

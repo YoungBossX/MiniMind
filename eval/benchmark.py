@@ -42,7 +42,7 @@ def load_model(weight, hidden_size, num_layers, device):
     model = MiniMindForCausalLM(config)
 
     ckp = os.path.join(SAVE_DIR, f"{weight}_{hidden_size}.pth")
-    state_dict = torch.load(ckp, map_location=device)
+    state_dict = torch.load(ckp, map_location=device, weights_only=True)
     model.load_state_dict(state_dict, strict=True)
     return model.eval().to(device), tokenizer
 
