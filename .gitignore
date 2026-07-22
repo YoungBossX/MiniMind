@@ -99,6 +99,8 @@ clap-htsat-unfused
 **/*.md
 
 # Project documentation (override the generic Markdown ignore above)
+!AGENTS.md
+!CLAUDE.md
 !docs/
 !docs/**/*.md
 !evals/README.md
