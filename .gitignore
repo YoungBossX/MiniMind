@@ -98,6 +98,11 @@ clap-htsat-unfused
 *.md
 **/*.md
 
+# Project documentation (override the generic Markdown ignore above)
+!docs/
+!docs/**/*.md
+!evals/README.md
+
 # pdf文件
 *.pdf
 **/*.pdf
@@ -138,3 +143,6 @@ eval/reports/*.md
 !eval/test_data/*.jsonl
 !eval/test_data/.gitkeep
 !eval/reports/.gitkeep
+!model/tokenizer.json
+!model/tokenizer_config.json
+!evals/data/*.jsonl

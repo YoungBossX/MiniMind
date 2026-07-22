@@ -1,4 +1,4 @@
-# CC_Handmaking_LLM
+# MiniMind (CC_Handmaking_LLM)
 
 从零实现的轻量级语言模型训练框架。模型主体使用 PyTorch 从零实现，不使用
 transformers 内置模型架构；项目仍依赖 transformers 的 `PretrainedConfig`、
@@ -25,6 +25,12 @@ transformers 内置模型架构；项目仍依赖 transformers 的 `PretrainedCo
 
 ## 快速开始
 
+下列示例以项目根目录为当前目录。在已安装 PyTorch 2.5 或更高版本的 Python 环境中安装依赖：
+
+```bash
+python -m pip install -r requirements.txt
+```
+
 ```bash
 # 预训练
 python trainer/train_pretrain.py --epochs 2 --batch_size 32 --learning_rate 5e-4
@@ -49,8 +55,11 @@ Tokenizer 或 Reward Model 若只填写远程 Hugging Face Hub ID，后续无法
 ## 评测
 
 ```bash
-# 框架正确性 smoke test（CPU 可跑）
-python eval/smoke_test.py --all
+# 非 RL 管线 smoke test（CPU 友好）
+python eval/smoke_test.py --all --skip-rl --device cpu
+
+# 包含 PPO/GRPO 的完整 smoke test（需要本地 Reward Model，GPU 更合适）
+python eval/smoke_test.py --all --device cuda:0
 
 # 模型质量 benchmark
 python eval/benchmark.py --weight dpo --stage all
@@ -72,5 +81,23 @@ python evals/eval_speed.py --checkpoint_path out/dpo_512.pth --device cuda
 
 `evals/run_all.py` 默认要求 `--checkpoint_path`。`--allow_random_init` 只用于
 smoke test，随机初始化模型的 QA、生成等质量指标不具备参考价值。
+
+`eval/benchmark.py` 的传统 benchmark 只加载 dense 模型；评估 MoE 权重时，单项
+评估脚本可传入 `--use_moe`，`evals/run_all.py` 则在配置文件中设置
+`model.use_moe: true`。
+
+评估前可先审计数据格式和重复样本：
+
+```bash
+python scripts/audit_data.py --registry_dir data_registry --output_path outputs/data_audit.json
+```
+
+评估后可生成待人工审核的反馈候选：
+
+```bash
+python feedback/run_feedback_loop.py --eval_dir outputs/evals --output_dir feedback/candidates
+```
+
+反馈候选默认标记为 `needs_review`，assistant 内容为空；审核并补全答案前不能直接用于 SFT。
 
 详见 `evals/README.md`。

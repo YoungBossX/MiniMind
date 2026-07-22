@@ -1,5 +1,7 @@
 # MiniMind 评测系统设计
 
+> 状态（2026-07-22）：历史设计记录。接口和实现可能已演进；现行行为以代码、测试和根 README 为准。
+
 日期：2026-05-05
 
 ## 开发环境
@@ -156,7 +158,7 @@ def save_md_report(report, path)
 def init_swanlab(project="MiniMind-Eval")
 def log_to_swanlab(stage, metrics, step)
 
-# Smoke test 通用模板
+# Smoke test 通用模板（原始设计接口）
 def run_smoke_test(train_fn, stage_name, config, assertions) -> bool  # passed?
 
 # 指标
@@ -164,6 +166,8 @@ def compute_perplexity(model, dataloader) -> float
 def check_grad_flow(model) -> dict  # {grad_norm, has_nan}
 def verify_checkpoint_roundtrip(model, save_path, sample_input) -> bool
 ```
+
+当前 smoke 实现使用 `run_stage`，上面的 `run_smoke_test` 仅保留为原始设计接口记录。
 
 ### 依赖关系
 

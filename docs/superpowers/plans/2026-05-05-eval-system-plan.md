@@ -1,5 +1,7 @@
 # MiniMind 评测系统实现计划
 
+> 状态（2026-07-22）：历史实施记录。未勾选复选框保留原计划形态，不表示仍有待办；现行行为以代码、测试和根 README 为准。
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** 构建闭环评测系统，覆盖框架正确性（7 个训练管线的 smoke test）和模型质量（perplexity、生成质量、reasoning 格式、reward 分布）两层评测。

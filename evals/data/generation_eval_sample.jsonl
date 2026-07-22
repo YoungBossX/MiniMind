@@ -1,0 +1,5 @@
+{"id": "001", "prompt": "请用三点说明机器学习的主要应用领域。", "constraints": {"min_length": 50, "max_length": 300, "must_include": ["机器学习"], "forbid_include": ["我不知道"]}}
+{"id": "002", "prompt": "请介绍PyTorch框架", "constraints": {"min_length": 30, "max_length": 500, "must_include": ["PyTorch", "GPU"], "forbid_include": []}}
+{"id": "003", "prompt": "请输出一个JSON格式的回答，包含name和description两个字段，描述什么是深度学习。", "constraints": {"json_required": true, "required_keys": ["name", "description"], "max_length": 500}}
+{"id": "004", "prompt": "用一句话解释什么是自然语言处理。", "constraints": {"min_length": 10, "max_length": 200, "must_include": [], "forbid_include": []}}
+{"id": "005", "prompt": "请以JSON格式回答，包含title和steps两个字段，介绍模型训练的步骤。", "constraints": {"json_required": true, "required_keys": ["title", "steps"], "max_length": 400}}

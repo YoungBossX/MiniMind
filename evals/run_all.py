@@ -104,7 +104,12 @@ def _load_stage_metrics(path, returncode):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="MiniMind Run All Evaluations")
-    parser.add_argument("--checkpoint_path", type=str, default="", help="模型权重 .pth 路径（为空则使用随机初始化模型）")
+    parser.add_argument(
+        "--checkpoint_path",
+        type=str,
+        default="",
+        help="模型权重 .pth 路径（默认必填；随机初始化需显式传入 --allow_random_init）",
+    )
     parser.add_argument("--tokenizer_path", type=str, default="", help="Tokenizer 目录路径")
     parser.add_argument("--config_path", type=str, default="evals/configs/eval_config.yaml", help="YAML 配置路径")
     parser.add_argument("--device", type=str, default="")
