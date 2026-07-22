@@ -40,6 +40,11 @@ from trainer.trainer_utils import (
     accumulation_window_size,
     should_optimizer_step,
     checkpoint_due,
+    build_checkpoint_metadata,
+    load_model_state,
+    save_inference_weights,
+    resolve_checkpoint_dir,
+    coordinated_checkpoint_save,
 )
 from trainer.path_utils import resolve_project_paths
 
@@ -164,7 +169,7 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
                     {"loss": current_loss, "lr": current_lr, "epoch_Time": eta_min}
                 )
 
-        if did_optimizer_step and checkpoint_due(step, iters, args.accumulation_steps, args.save_interval) and is_main_process():
+        if did_optimizer_step and checkpoint_due(step, iters, args.accumulation_steps, args.save_interval):
             model.eval() # 切换到评估模式
 
             # 构建保存文件路径
@@ -174,31 +179,23 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             )
             ckp = f"{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth"
 
-            # DDP 模型有额外封装层，真正的模型在 .module 属性里
-            # 非 DDP 模型直接调用 state_dict()
-            if isinstance(model, torch.nn.parallel.DistributedDataParallel):
-                state_dict = model.module.state_dict()
-            else:
-                state_dict = model.state_dict()
-
-            # 将所有参数从 float32 转为 float16（半精度）再保存
-            # 优点：文件大小减半，加载更快
-            # 代价：精度略有损失（推理时通常可以接受）
-            state_dict = {k: v.half() for k, v in state_dict.items()}
-            torch.save(state_dict, ckp)
-
             # 保存完整训练状态（用于断点续训）：
             # 包含 model weights、optimizer state、scaler state、epoch、step、wandb_id
-            lm_checkpoint(
-                lm_config,
-                weight=args.save_weight,
-                model=model,
-                optimizer=optimizer,
-                scaler=scaler,
-                epoch=epoch,
-                step=step,
-                wandb=wandb,
-                save_dir="checkpoints",
+            coordinated_checkpoint_save(
+                primary_save=lambda: lm_checkpoint(
+                    lm_config,
+                    weight=args.save_weight,
+                    model=model,
+                    optimizer=optimizer,
+                    scaler=scaler,
+                    epoch=epoch,
+                    step=step,
+                    wandb=wandb,
+                    save_dir=args.checkpoint_dir,
+                    metadata=checkpoint_metadata,
+                    save_inference=False,
+                ),
+                derived_save=lambda: save_inference_weights(model, ckp),
             )
 
             model.train()
@@ -208,6 +205,7 @@ if __name__ == "__main__":
 
     # ========== 基础训练参数 ==========
     parser.add_argument("--save_dir", type=str, default="out", help="模型保存目录")
+    parser.add_argument("--checkpoint_dir", type=str, default=None, help="断点续训目录（默认 <save_dir>/checkpoints）")
     parser.add_argument("--save_weight", default="pretrain", type=str, help="保存权重的前缀名")
     parser.add_argument("--epochs", type=int, default=1, help="训练轮数（建议1轮zero或2-6轮充分训练）")
     parser.add_argument("--batch_size", type=int, default=32, help="batch size")
@@ -233,7 +231,8 @@ if __name__ == "__main__":
     # ========== 数据和恢复参数 ==========
     parser.add_argument("--data_path", type=str, default="dataset/pretrain_hq.jsonl", help="预训练数据路径",)
     parser.add_argument("--from_weight", default="none", type=str, help="基于哪个权重训练，为none则从头开始")
-    parser.add_argument("--from_resume", default=1, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
+    parser.add_argument("--from_resume", default=0, type=int, choices=[0, 1], help="是否显式从检查点续训（0=否，1=是）")
+    parser.add_argument("--allow_legacy_resume", default=0, type=int, choices=[0, 1], help="允许恢复缺少安全元数据的旧检查点")
 
     # ========== 实验跟踪参数 ==========
     parser.add_argument("--use_wandb", action="store_true", help="是否使用wandb")
@@ -241,7 +240,8 @@ if __name__ == "__main__":
 
     # 解析命令行参数
     args = parser.parse_args()
-    args = resolve_project_paths(args, "save_dir", "data_path")
+    args = resolve_project_paths(args, "save_dir", "data_path", "checkpoint_dir")
+    args.checkpoint_dir = resolve_checkpoint_dir(args.save_dir, args.checkpoint_dir)
 
     # ========== 1. 初始化环境和随机种子 ==========
     """
@@ -274,12 +274,17 @@ if __name__ == "__main__":
         num_hidden_layers=args.num_hidden_layers,
         use_moe=bool(args.use_moe),
     )
+    checkpoint_metadata = build_checkpoint_metadata(args, lm_config, "pretrain")
 
     # 📚 断点续训知识点
     # 如果开启了断点续训，尝试加载之前的训练状态
     ckp_data = (
         lm_checkpoint(
-            lm_config, weight=args.save_weight, save_dir="checkpoints"
+            lm_config,
+            weight=args.save_weight,
+            save_dir=args.checkpoint_dir,
+            expected_metadata=checkpoint_metadata,
+            allow_legacy_resume=bool(args.allow_legacy_resume),
         )
         if args.from_resume == 1
         else None
@@ -333,7 +338,11 @@ if __name__ == "__main__":
     - 缩放器: 混合精度训练的梯度缩放
     """
     # 初始化模型和分词器
-    model, tokenizer = init_model(lm_config, args.from_weight, save_dir=args.save_dir, device=args.device)
+    model, tokenizer = init_model(
+        lm_config, args.from_weight, save_dir=args.save_dir,
+        resume_dir=args.checkpoint_dir, device=args.device,
+        allow_legacy_resume=bool(args.allow_legacy_resume),
+    )
 
     train_ds = PretrainDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
 
@@ -346,7 +355,7 @@ if __name__ == "__main__":
     start_epoch, start_step = 0, 0
     if ckp_data:
         # 恢复模型参数
-        model.load_state_dict(ckp_data["model"])
+        load_model_state(model, ckp_data["model"])
         # 恢复优化器状态（动量、方差估计等）
         optimizer.load_state_dict(ckp_data["optimizer"])
         # 恢复梯度缩放器状态
@@ -388,3 +397,18 @@ if __name__ == "__main__":
             train_epoch(epoch, loader, len(loader) + start_step, start_step, wandb)
         else:
             train_epoch(epoch, loader, len(loader), 0, wandb)
+
+    Logger("Training finished. Saving final checkpoint...")
+    model.eval()
+    moe_suffix = "_moe" if lm_config.use_moe else ""
+    ckp = f"{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth"
+    coordinated_checkpoint_save(
+        primary_save=lambda: lm_checkpoint(
+            lm_config, weight=args.save_weight, model=model, optimizer=optimizer,
+            scaler=scaler, epoch=args.epochs, step=0, wandb=wandb,
+            save_dir=args.checkpoint_dir, metadata=checkpoint_metadata,
+            save_inference=False,
+        ),
+        derived_save=lambda: save_inference_weights(model, ckp),
+    )
+    Logger(f"Final model saved to {ckp}")

@@ -28,8 +28,8 @@ def build_sft_candidates(failures):
     for failure in failures:
         prompt = failure.get("input", "")
         reference = failure.get("reference", "")
-        status = "ready" if reference.strip() else "needs_review"
-        assistant_content = reference if status == "ready" else ""
+        status = "needs_review"
+        assistant_content = ""
         candidates.append({
             "status": status,
             "conversations": [
@@ -42,6 +42,7 @@ def build_sft_candidates(failures):
                 "failure_type": failure.get("failure_type", ""),
                 "suggested_stage": failure.get("suggested_stage", "sft"),
                 "prediction": failure.get("prediction", ""),
+                "reference_suggestion": reference,
                 "details": failure.get("details", {}),
             },
         })

@@ -63,6 +63,12 @@ def validate_dpo_conversation(conversation, side, line_no):
 
 
 def validate_sample(sample, stage, line_no):
+    if not isinstance(sample, dict):
+        return [_issue(
+            line_no,
+            "invalid_sample_type",
+            f"sample must be a JSON object, got {type(sample).__name__}",
+        )]
     if "__json_error__" in sample:
         return [_issue(line_no, "invalid_json", sample["__json_error__"])]
 
@@ -81,7 +87,20 @@ def validate_sample(sample, stage, line_no):
         if "assistant" not in roles:
             issues.append(_issue(line_no, "sft_missing_assistant", "SFT sample needs an assistant turn"))
         for idx, turn in enumerate(conversations):
-            content = turn.get("content") if isinstance(turn, dict) else None
+            if not isinstance(turn, dict):
+                issues.append(_issue(
+                    line_no,
+                    "sft_invalid_turn",
+                    f"turn {idx} must be an object",
+                ))
+                continue
+            if turn.get("role") not in {"system", "user", "assistant"}:
+                issues.append(_issue(
+                    line_no,
+                    "sft_invalid_role",
+                    f"turn {idx} has an unsupported role",
+                ))
+            content = turn.get("content")
             if not isinstance(content, str) or not content.strip():
                 issues.append(_issue(line_no, "empty_content", f"turn {idx} has empty content"))
         return issues
@@ -92,7 +111,7 @@ def validate_sample(sample, stage, line_no):
             value = sample.get(key)
             if not isinstance(value, list) or not value:
                 issues.append(_issue(line_no, f"dpo_missing_{key}", f"DPO sample needs non-empty {key} list"))
-            elif not issues:
+            else:
                 issues.extend(validate_dpo_conversation(value, key, line_no))
         if not issues:
             if (
@@ -109,6 +128,12 @@ def validate_sample(sample, stage, line_no):
                     line_no,
                     "dpo_prompt_mismatch",
                     "chosen and rejected must share the same conversation prefix",
+                ))
+            elif sample["chosen"][-1]["content"] == sample["rejected"][-1]["content"]:
+                issues.append(_issue(
+                    line_no,
+                    "dpo_identical_responses",
+                    "chosen and rejected responses must differ",
                 ))
         return issues
 
@@ -136,24 +161,51 @@ def validate_sample(sample, stage, line_no):
 
 def audit_jsonl_file(path, stage):
     path = Path(path)
-    rows = load_jsonl(path)
     issues = []
     valid_samples = 0
+    total_samples = 0
+    duplicate_samples = 0
+    seen_rows = set()
+    file_digest = hashlib.sha256()
 
-    for line_no, sample in rows:
-        sample_issues = validate_sample(sample, stage, line_no)
-        if sample_issues:
-            issues.extend(sample_issues)
-        else:
-            valid_samples += 1
+    with path.open("rb") as f:
+        for line_no, raw_line in enumerate(f, start=1):
+            file_digest.update(raw_line)
+            stripped = raw_line.strip()
+            if not stripped:
+                continue
+            total_samples += 1
+
+            row_digest = hashlib.blake2b(stripped, digest_size=16).digest()
+            if row_digest in seen_rows:
+                duplicate_samples += 1
+                issues.append(_issue(
+                    line_no,
+                    "duplicate_row",
+                    "exact duplicate of an earlier JSONL row",
+                ))
+                continue
+            seen_rows.add(row_digest)
+
+            try:
+                sample = json.loads(stripped)
+            except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+                sample = {"__json_error__": str(exc)}
+
+            sample_issues = validate_sample(sample, stage, line_no)
+            if sample_issues:
+                issues.extend(sample_issues)
+            else:
+                valid_samples += 1
 
     return {
         "path": str(path),
         "stage": stage,
-        "sha256": sha256_file(path) if path.exists() else "",
-        "total_samples": len(rows),
+        "sha256": file_digest.hexdigest(),
+        "total_samples": total_samples,
         "valid_samples": valid_samples,
-        "invalid_samples": len(rows) - valid_samples,
+        "invalid_samples": total_samples - valid_samples,
+        "duplicate_samples": duplicate_samples,
         "issues": issues,
     }
 
@@ -187,6 +239,7 @@ def audit_registry(registry_dir):
                 "total_samples": 0,
                 "valid_samples": 0,
                 "invalid_samples": 0,
+                "duplicate_samples": 0,
                 "issues": [_issue(0, "missing_file", "registered data file does not exist")],
             })
             continue

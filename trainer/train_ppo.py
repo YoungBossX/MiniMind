@@ -25,23 +25,73 @@ import warnings
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
-from transformers import AutoTokenizer
 from contextlib import nullcontext
 from torch import optim, nn
 from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader, DistributedSampler
-from torch.nn.utils import clip_grad_norm_
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from transformers import AutoModel
 from model.MiniMindModel import MiniMindConfig, MiniMindForCausalLM
 from dataset.llm_dataset import RLAIFDataset
 from trainer.trainer_utils import (
     Logger, is_main_process, lm_checkpoint,
-    init_distributed_mode, setup_seed, SkipBatchSampler, init_model
+    init_distributed_mode, setup_seed, SkipBatchSampler, init_model,
+    build_checkpoint_metadata, unwrap_model, load_model_state,
+    save_inference_weights, clamp_log_ratio, gather_rng_states,
+    restore_rng_state_for_rank, clip_gradients,
+    init_reference_model, synchronize_model_state,
+    load_reward_components, resolve_checkpoint_dir,
+    coordinated_checkpoint_save, tokenize_rl_prompts, build_rollout_masks,
+    chatml_prompt_messages
 )
 from trainer.path_utils import resolve_project_paths
  
 warnings.filterwarnings('ignore')
+
+
+def validate_args(args):
+    if not args.temperature > 0:
+        raise ValueError("PPO requires --temperature to be greater than 0.")
+    if args.dtype != "bfloat16":
+        raise ValueError("PPO only supports --dtype=bfloat16; float16 is not numerically safe.")
+    if args.ppo_epochs < 1:
+        raise ValueError("PPO requires --ppo_epochs to be at least 1.")
+    if args.accumulation_steps != 1:
+        raise ValueError(
+            "PPO requires --accumulation_steps=1 because each PPO epoch performs an optimizer step."
+        )
+
+
+def sampled_k3_kl(policy_logp, ref_logp):
+    """Sampled k3 KL estimator using d = log(pi_ref) - log(pi_policy)."""
+    d = clamp_log_ratio(ref_logp - policy_logp)
+    return torch.exp(d) - d - 1.0
+
+
+def clipped_surrogate_loss(actor_logps, old_logps, advantages, clip_epsilon):
+    ratio = torch.exp(clamp_log_ratio(actor_logps - old_logps))
+    unclipped = ratio * advantages
+    clipped = torch.clamp(
+        ratio, 1.0 - clip_epsilon, 1.0 + clip_epsilon
+    ) * advantages
+    return -torch.min(unclipped, clipped), ratio
+
+
+def get_token_logps_and_entropy(logits, labels, temperature):
+    if not temperature > 0:
+        raise ValueError("temperature must be greater than 0")
+    log_probs = F.log_softmax(logits / temperature, dim=-1)
+    token_logps = log_probs.gather(2, labels.unsqueeze(-1)).squeeze(-1)
+    entropy = -(log_probs.exp() * log_probs).sum(dim=-1)
+    return token_logps, entropy
+
+
+def synchronize_early_stop(should_stop, device):
+    """Return True on every rank when any rank requests PPO early stopping."""
+    if not dist.is_initialized():
+        return bool(should_stop)
+    stop_flag = torch.tensor(int(should_stop), device=device, dtype=torch.int32)
+    dist.all_reduce(stop_flag, op=dist.ReduceOp.MAX)
+    return bool(stop_flag.item())
  
 # ============================================================================
 #  Critic 模型: 继承 MiniMindForCausalLM
@@ -65,6 +115,23 @@ class CriticModel(MiniMindForCausalLM):
         # 通过 value_head 计算状态值
         values = self.value_head(hidden_states).squeeze(-1) # 形状为 (batch_size, seq_len)
         return values
+
+
+def initialize_critic_from_actor(lm_config, actor_model, device):
+    """Initialize the critic backbone from the actor's loaded full-precision state."""
+    critic_model = CriticModel(lm_config)
+    incompatible = critic_model.load_state_dict(
+        unwrap_model(actor_model).state_dict(), strict=False
+    )
+    expected_missing = {"value_head.weight", "value_head.bias"}
+    unexpected_missing = set(incompatible.missing_keys) - expected_missing
+    if unexpected_missing or incompatible.unexpected_keys:
+        raise RuntimeError(
+            "Actor state is incompatible with the PPO critic: "
+            f"missing={sorted(unexpected_missing)}, "
+            f"unexpected={sorted(incompatible.unexpected_keys)}"
+        )
+    return critic_model.to(device)
     
 # ============================================================================
 #  GAE: Generalized Advantage Estimation (per-token)
@@ -92,30 +159,56 @@ def compute_gae(rewards_scalar, values_seq, resp_mask, gamma=1.0, lam=0.95):
     B, T = values_seq.shape 
     device = values_seq.device
 
+    if T == 0:
+        return torch.zeros_like(values_seq), torch.zeros_like(values_seq)
+
+    valid_mask = resp_mask.to(device=device, dtype=torch.bool)
+
     # 构造 per-token reward: 只在每个序列最后一个 response token 放 reward
-    per_token_rewards = torch.zeros(B, T, device=device)
+    per_token_rewards = torch.zeros_like(values_seq)
     # 找到每个序列最后一个 response token 的位置
-    last_resp_indices = (resp_mask * torch.arange(T, device=device).unsqueeze(0)).argmax(dim=1)  # [B]
-    per_token_rewards[torch.arange(B, device=device), last_resp_indices] = rewards_scalar
+    token_indices = torch.arange(T, device=device).unsqueeze(0).expand(B, -1)
+    last_resp_indices = token_indices.masked_fill(~valid_mask, -1).max(dim=1).values
+    valid_rows = last_resp_indices >= 0
+    per_token_rewards[
+        torch.arange(B, device=device)[valid_rows], last_resp_indices[valid_rows]
+    ] = rewards_scalar.to(device=device, dtype=values_seq.dtype)[valid_rows]
 
     # 反向递推计算 GAE
-    advantages = torch.zeros(B, T, device=device)
-    gae = torch.zeros(B, device=device)
+    advantages = torch.zeros_like(values_seq)
+    gae = torch.zeros(B, device=device, dtype=values_seq.dtype)
  
     for t in reversed(range(T)):
-        mask_t = resp_mask[:, t].float()  # [B]
+        mask_t = valid_mask[:, t]
         if t == T - 1:
-            next_value = torch.zeros(B, device=device)
+            next_value = torch.zeros(B, device=device, dtype=values_seq.dtype)
+            next_mask = torch.zeros(B, device=device, dtype=torch.bool)
         else:
-            next_value = values_seq[:, t + 1]
+            next_mask = valid_mask[:, t + 1]
+            next_value = torch.where(
+                next_mask,
+                values_seq[:, t + 1],
+                torch.zeros(B, device=device, dtype=values_seq.dtype),
+            )
+        current_value = torch.where(
+            mask_t,
+            values_seq[:, t],
+            torch.zeros(B, device=device, dtype=values_seq.dtype),
+        )
         # TD error: δ_t = r_t + γ * V(s_{t+1}) - V(s_t)
-        delta = per_token_rewards[:, t] + gamma * next_value - values_seq[:, t]
+        delta = per_token_rewards[:, t] + gamma * next_value - current_value
         # GAE: A_t = δ_t + γλ * A_{t+1}
-        gae = delta + gamma * lam * gae
+        gae = torch.where(
+            mask_t,
+            delta + gamma * lam * gae,
+            torch.zeros(B, device=device, dtype=values_seq.dtype),
+        )
         # 只在 response token 上累积 advantage
-        advantages[:, t] = gae * mask_t
+        advantages[:, t] = gae
  
-    returns = advantages + values_seq  # TD(λ) return target
+    returns = torch.where(
+        valid_mask, advantages + values_seq, torch.zeros_like(values_seq)
+    )  # TD(λ) return target
     return advantages, returns
 
 # ============================================================================
@@ -179,9 +272,7 @@ def calculate_rewards(prompts, responses, reward_model, reward_tokenizer, args):
         for prompt, response in zip(prompts, responses):
             # 从 prompt 中解析出 chat 格式的 messages
             # prompt 长这样: <|im_start|>user\n你好<|im_end|>\n<|im_start|>assistant\n
-            pattern = r"<\|im_start\|>(system|user|assistant)\s+(.*?)<\|im_end\|>"
-            matches = re.findall(pattern, prompt, re.DOTALL)
-            messages = [{"role": role, "content": content.strip()} for role, content in matches]
+            messages = chatml_prompt_messages(prompt)
             # 拼上 response, 送给 reward model 打分
             tmp_chat = messages + [{"role": "assistant", "content": response}]
             score = reward_model.get_score(reward_tokenizer, tmp_chat)
@@ -233,8 +324,9 @@ def collect_rollout(prompts, actor_model, critic_model, ref_model,
     # ---- 1. 编码 prompt ----
     # padding_side="left" 是因为生成时需要从右边续写
     # 如果右边 pad 了, generate 会在 pad token 后面续写, 不对
-    enc = tokenizer(prompts, return_tensors="pt", padding=True, truncation=True,
-                    max_length=args.max_seq_len, padding_side="left").to(args.device)
+    enc, actor_prompts = tokenize_rl_prompts(
+        tokenizer, prompts, max_length=args.max_seq_len, device=args.device
+    )
     prompt_length = enc.input_ids.shape[1]
  
     # ---- 2. Actor 生成回答 ----
@@ -245,17 +337,20 @@ def collect_rollout(prompts, actor_model, critic_model, ref_model,
     model_for_gen.eval()
     gen_out = model_for_gen.generate(
         input_ids=enc.input_ids, attention_mask=enc.attention_mask,
-        max_new_tokens=args.max_gen_len, do_sample=True, temperature=0.8,
+        max_new_tokens=args.max_gen_len, do_sample=True, temperature=args.temperature,
+        top_k=0,
         pad_token_id=tokenizer.pad_token_id, eos_token_id=tokenizer.eos_token_id
     )
  
     # ---- 3. 解码文本 & 计算 reward ----
     responses_text = [tokenizer.decode(gen_out[i, prompt_length:], skip_special_tokens=True) for i in range(len(prompts))]
-    rewards = calculate_rewards(prompts, responses_text, reward_model, reward_tokenizer, args)  # [B]
+    rewards = calculate_rewards(actor_prompts, responses_text, reward_model, reward_tokenizer, args)  # [B]
 
     # ---- 4. 构造各种 mask ----
     # full_mask: 哪些位置不是 padding (用于 attention)
-    full_mask = (gen_out != tokenizer.pad_token_id).long()  # [B, P+R]
+    full_mask, action_mask = build_rollout_masks(
+        enc.attention_mask, gen_out, tokenizer.eos_token_id
+    )
     # labels: 用于计算 log-prob 的目标 token (右移一位)
     # 因为语言模型预测的是 "下一个 token", 所以 labels = input[1:]
     # 例如 input = [A, B, C, D], labels = [B, C, D]
@@ -265,9 +360,12 @@ def collect_rollout(prompts, actor_model, critic_model, ref_model,
     
     # resp_mask: 标记哪些位置属于 response (排除 prompt 和 padding)
     # prompt_length-1 是因为 labels 比 input 少一个 token
-    resp_mask = torch.arange(seq_len, device=gen_out.device).unsqueeze(0) >= (prompt_length - 1)
-    pad_mask = ~labels.eq(tokenizer.pad_token_id)
-    resp_mask = resp_mask & pad_mask  # [B, T]
+    prompt_label_mask = torch.zeros(
+        (gen_out.size(0), prompt_length - 1),
+        dtype=torch.bool,
+        device=gen_out.device,
+    )
+    resp_mask = torch.cat((prompt_label_mask, action_mask), dim=1)  # [B, T]
  
     # ---- 5. 计算各模型的 per-token log-prob ----
     with autocast_ctx:
@@ -285,8 +383,8 @@ def collect_rollout(prompts, actor_model, critic_model, ref_model,
     # 计算 per-token log-probability
     # log_softmax 得到 log(概率分布), gather 取出 label 对应的那个 log-prob
     # 例如 logits=[0.1, 0.8, 0.1], label=1, 则 log_softmax→[-2.4, -0.4, -2.4], gather→-0.4
-    old_logp = F.log_softmax(sampled_policy_logits, dim=-1).gather(2, labels.unsqueeze(-1)).squeeze(-1)  # [B, T]
-    ref_logp = F.log_softmax(ref_logits, dim=-1).gather(2, labels.unsqueeze(-1)).squeeze(-1)  # [B, T]
+    old_logp = F.log_softmax(sampled_policy_logits / args.temperature, dim=-1).gather(2, labels.unsqueeze(-1)).squeeze(-1)  # [B, T]
+    ref_logp = F.log_softmax(ref_logits / args.temperature, dim=-1).gather(2, labels.unsqueeze(-1)).squeeze(-1)  # [B, T]
  
     # ---- 6. 用 GAE 计算 per-token advantage ----
     advantages, returns = compute_gae(
@@ -361,8 +459,9 @@ def ppo_update(rollout, actor_model, critic_model, actor_optimizer, critic_optim
             logits = res.logits[:, :-1]  # [B, T, V]
             aux_loss = res.aux_loss if lm_config.use_moe else torch.tensor(0.0, device=args.device)
  
-        log_probs_all = F.log_softmax(logits, dim=-1)  # [B, T, V]
-        actor_logp = log_probs_all.gather(2, labels.unsqueeze(-1)).squeeze(-1)  # [B, T]
+        actor_logp, entropy_per_token = get_token_logps_and_entropy(
+            logits, labels, args.temperature
+        )
  
         # ================================================================
         #  Entropy Bonus: 防止策略过早收敛
@@ -370,8 +469,6 @@ def ppo_update(rollout, actor_model, critic_model, actor_optimizer, critic_optim
         # H(π) = -Σ_a π(a) * log π(a)
         # 如果 entropy 很低, 说明模型对输出非常确定, 不再探索其他可能性
         # 加上 entropy bonus 鼓励模型保持一定的随机性
-        probs_all = log_probs_all.exp()
-        entropy_per_token = -(probs_all * log_probs_all).sum(dim=-1)  # [B, T]
         # 只在 response token 上计算平均 entropy
         entropy = (entropy_per_token * resp_mask).sum() / (resp_mask.sum() + 1e-8)
  
@@ -402,10 +499,9 @@ def ppo_update(rollout, actor_model, critic_model, actor_optimizer, critic_optim
         # 如果 advantage < 0 (坏 action):
         #   min(ratio*A, clip(ratio)*A) 会在 ratio < 1-ε 时停止下降
         #   防止对坏 action 过度减少概率
-        ratio = torch.exp(actor_logp - old_logp)  # [B, T]
-        surr1 = ratio * advantages
-        surr2 = torch.clamp(ratio, 1.0 - args.clip_epsilon, 1.0 + args.clip_epsilon) * advantages
-        policy_loss_per_token = -torch.min(surr1, surr2)  # [B, T]
+        policy_loss_per_token, ratio = clipped_surrogate_loss(
+            actor_logp, old_logp, advantages, args.clip_epsilon
+        )
         policy_loss = (policy_loss_per_token * resp_mask).sum() / (resp_mask.sum() + 1e-8)
  
         # Clip fraction (诊断指标)
@@ -437,11 +533,9 @@ def ppo_update(rollout, actor_model, critic_model, actor_optimizer, critic_optim
         #   输出 reward model 喜欢但实际质量很差的内容 (reward hacking).
         #   加上 KL 惩罚, 让模型不能偏离初始策略太远, 保持一定的 "正常".
         #
-        # 公式: KL ≈ r - 1 - log(r), 其中 r = exp(logp_new - logp_ref)
+        # 公式: KL ≈ exp(d) - d - 1, 其中 d = logp_ref - logp_new
         # 这是 KL 散度的二阶近似, 非负, 在 r=1 时为 0
-        log_ratio_ref = actor_logp - ref_logp  # [B, T]
-        ratio_ref = torch.exp(log_ratio_ref)
-        kl_ref_per_token = ratio_ref - 1 - log_ratio_ref  # [B, T], 非负
+        kl_ref_per_token = sampled_k3_kl(actor_logp, ref_logp)
         kl_ref = (kl_ref_per_token * resp_mask).sum() / (resp_mask.sum() + 1e-8)
  
         # ================================================================
@@ -449,10 +543,10 @@ def ppo_update(rollout, actor_model, critic_model, actor_optimizer, critic_optim
         # ================================================================
         # approx_kl 衡量当前 actor 和采样时 actor 之间的 KL
         # 如果太大, 说明这批数据已经被 "用完了", 继续更新反而有害
-        log_ratio_old = actor_logp - old_logp  # [B, T]
-        approx_kl = (log_ratio_old.exp() - 1 - log_ratio_old)  # [B, T]
+        approx_kl = sampled_k3_kl(old_logp, actor_logp)
         approx_kl = (approx_kl * resp_mask).sum() / (resp_mask.sum() + 1e-8)
-        if ppo_ep > 0 and approx_kl.item() > args.target_kl:
+        local_early_stop = ppo_ep > 0 and approx_kl.item() > args.target_kl
+        if synchronize_early_stop(local_early_stop, approx_kl.device):
             Logger(f"  PPO epoch {ppo_ep}: early stop, approx_kl={approx_kl.item():.4f} > target_kl={args.target_kl}")
             break
  
@@ -474,8 +568,8 @@ def ppo_update(rollout, actor_model, critic_model, actor_optimizer, critic_optim
         )
  
         loss.backward()
-        clip_grad_norm_(actor_model.parameters(), args.grad_clip)
-        clip_grad_norm_(critic_model.parameters(), args.grad_clip)
+        clip_gradients(actor_model.parameters(), args.grad_clip)
+        clip_gradients(critic_model.parameters(), args.grad_clip)
         actor_optimizer.step()
         critic_optimizer.step()
         actor_scheduler.step()
@@ -594,21 +688,26 @@ def ppo_train_epoch(epoch, loader, iters, ref_model,
                 )
  
         # ---- Step 4: 保存 checkpoint ----
-        if (step % args.save_interval == 0 or step == iters) and is_main_process():
+        if step % args.save_interval == 0 or step == iters:
+            rng_state_by_rank = gather_rng_states(args.device)
             actor_model.eval()
             moe_suffix = '_moe' if lm_config.use_moe else ''
             ckp = f'{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
-            raw_actor = actor_model.module if isinstance(actor_model, DistributedDataParallel) else actor_model
-            raw_actor = getattr(raw_actor, '_orig_mod', raw_actor)
-            actor_state = raw_actor.state_dict()
-            torch.save({k: v.half().cpu() for k, v in actor_state.items()}, ckp)
- 
-            lm_checkpoint(lm_config, weight=args.save_weight, model=actor_model, optimizer=actor_optimizer,
-                          epoch=epoch, step=step, wandb=wandb, save_dir='checkpoints',
-                          scheduler=actor_scheduler, critic_model=critic_model,
-                          critic_optimizer=critic_optimizer, critic_scheduler=critic_scheduler)
+            coordinated_checkpoint_save(
+                primary_save=lambda: lm_checkpoint(
+                    lm_config, weight=args.save_weight, model=actor_model,
+                    optimizer=actor_optimizer, epoch=epoch, step=step,
+                    wandb=wandb, save_dir=args.checkpoint_dir,
+                    scheduler=actor_scheduler, critic_model=critic_model,
+                    critic_optimizer=critic_optimizer,
+                    critic_scheduler=critic_scheduler,
+                    metadata=checkpoint_metadata,
+                    rng_state_by_rank=rng_state_by_rank,
+                    ref_model=ref_model, save_inference=False,
+                ),
+                derived_save=lambda: save_inference_weights(actor_model, ckp),
+            )
             actor_model.train()
-            del actor_state
  
         # 清理显存
         del rollout
@@ -620,6 +719,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MiniMind PPO (Improved)")
     # --- 基础参数 ---
     parser.add_argument("--save_dir", type=str, default="out")
+    parser.add_argument("--checkpoint_dir", type=str, default=None, help="断点续训目录（默认 <save_dir>/checkpoints）")
     parser.add_argument('--save_weight', default='ppo_actor', type=str)
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=4)
@@ -639,6 +739,7 @@ if __name__ == "__main__":
     parser.add_argument('--use_moe', default=0, type=int, choices=[0, 1])
     parser.add_argument('--max_seq_len', default=66, type=int, help="Prompt 最大长度")
     parser.add_argument("--max_gen_len", type=int, default=512, help="生成最大长度")
+    parser.add_argument("--temperature", type=float, default=0.8, help="采样及策略统计温度")
     parser.add_argument("--data_path", type=str, default="dataset/rlaif-mini.jsonl")
  
     # --- PPO 核心超参数 ---
@@ -654,24 +755,23 @@ if __name__ == "__main__":
     # --- 其他 ---
     parser.add_argument("--reasoning", type=int, default=1, choices=[0, 1])
     parser.add_argument("--reward_model_path", type=str, default="internlm2-1_8b-reward")
-    parser.add_argument('--from_resume', default=1, type=int, choices=[0, 1])
+    parser.add_argument('--from_resume', default=0, type=int, choices=[0, 1], help="是否显式从检查点续训")
+    parser.add_argument('--allow_legacy_resume', default=0, type=int, choices=[0, 1], help="允许恢复缺少安全元数据的旧检查点")
     parser.add_argument("--use_wandb", action="store_true")
     parser.add_argument("--wandb_project", type=str, default="MiniMind-PPO-Improved")
     parser.add_argument("--use_compile", default=0, type=int, choices=[0, 1])
     args = parser.parse_args()
-    args = resolve_project_paths(args, "save_dir", "data_path", "reward_model_path")
-    if args.ppo_epochs < 1:
-        raise ValueError("PPO requires --ppo_epochs to be at least 1.")
-    if args.accumulation_steps != 1:
-        raise ValueError(
-            "PPO requires --accumulation_steps=1 because each PPO epoch performs an optimizer step."
-        )
+    args = resolve_project_paths(args, "save_dir", "data_path", "reward_model_path", "checkpoint_dir")
+    args.checkpoint_dir = resolve_checkpoint_dir(args.save_dir, args.checkpoint_dir)
+    validate_args(args)
  
     # ========== 1. 初始化环境 ==========
     local_rank = init_distributed_mode()
     if dist.is_initialized():
         args.device = f"cuda:{local_rank}"
-    setup_seed(42 + (dist.get_rank() if dist.is_initialized() else 0))
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    setup_seed(42 + rank)
  
     # ========== 2. 配置 ==========
     os.makedirs(args.save_dir, exist_ok=True)
@@ -680,11 +780,18 @@ if __name__ == "__main__":
         num_hidden_layers=args.num_hidden_layers,
         use_moe=bool(args.use_moe)
     )
-    ckp_data = lm_checkpoint(lm_config, weight=args.save_weight, save_dir='checkpoints') if args.from_resume == 1 else None
+    checkpoint_metadata = build_checkpoint_metadata(args, lm_config, "ppo")
+    ckp_data = lm_checkpoint(
+        lm_config,
+        weight=args.save_weight,
+        save_dir=args.checkpoint_dir,
+        expected_metadata=checkpoint_metadata,
+        allow_legacy_resume=bool(args.allow_legacy_resume),
+    ) if args.from_resume == 1 else None
  
     # ========== 3. 混合精度 ==========
     device_type = "cuda" if "cuda" in args.device else "cpu"
-    dtype = torch.bfloat16 if args.dtype == "bfloat16" else torch.float16
+    dtype = torch.bfloat16
     autocast_ctx = nullcontext() if device_type == "cpu" else torch.cuda.amp.autocast(dtype=dtype)
  
     # ========== 4. wandb ==========
@@ -713,27 +820,37 @@ if __name__ == "__main__":
     base_weight = "reason" if args.reasoning == 1 else "full_sft"
  
     # Actor
-    actor_model, tokenizer = init_model(lm_config, base_weight, save_dir=args.save_dir, device=args.device)
+    actor_model, tokenizer = init_model(
+        lm_config, base_weight, save_dir=args.save_dir,
+        resume_dir=args.checkpoint_dir, device=args.device,
+        allow_legacy_resume=bool(args.allow_legacy_resume),
+    )
     if args.use_compile == 1:
         actor_model = torch.compile(actor_model)
         Logger('torch.compile enabled')
  
     # Reference (frozen)
-    ref_model, _ = init_model(lm_config, base_weight, save_dir=args.save_dir, device=args.device)
+    ref_model, restored_ref = init_reference_model(
+        lm_config,
+        base_weight,
+        checkpoint=ckp_data,
+        save_dir=args.save_dir,
+        checkpoint_dir=args.checkpoint_dir,
+        device=args.device,
+        allow_legacy_resume=bool(args.allow_legacy_resume),
+    )
+    if ckp_data and not restored_ref:
+        Logger("Legacy checkpoint has no frozen reference snapshot.")
+    synchronize_model_state(ref_model)
     ref_model = ref_model.eval().requires_grad_(False)
  
     # Critic (从同样的 base weight 初始化, value_head 随机初始化)
-    moe_suffix = '_moe' if lm_config.use_moe else ''
-    ckp = f'{args.save_dir}/{base_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
-    state_dict = torch.load(ckp, map_location=args.device, weights_only=True)
-    critic_model = CriticModel(lm_config)
-    critic_model.load_state_dict(state_dict, strict=False)
-    critic_model = critic_model.to(args.device)
+    critic_model = initialize_critic_from_actor(lm_config, actor_model, args.device)
  
     # Reward Model (frozen)
-    reward_model = AutoModel.from_pretrained(args.reward_model_path, device_map="cuda", torch_dtype=torch.float16, trust_remote_code=True)
-    reward_model = reward_model.to(args.device).eval().requires_grad_(False)
-    reward_tokenizer = AutoTokenizer.from_pretrained(args.reward_model_path, trust_remote_code=True)
+    reward_model, reward_tokenizer = load_reward_components(
+        args.reward_model_path, args.device, dtype=torch.bfloat16
+    )
  
     # ========== 6. 数据和优化器 ==========
     train_ds = RLAIFDataset(args.data_path, tokenizer, max_length=(args.max_seq_len + args.max_gen_len))
@@ -750,15 +867,17 @@ if __name__ == "__main__":
  
     # ========== 7. 恢复训练状态 ==========
     start_epoch, start_step = 0, 0
+    resume_rng_state_by_rank = None
     if ckp_data:
-        actor_model.load_state_dict(ckp_data['model'])
-        critic_model.load_state_dict(ckp_data['critic_model'])
+        load_model_state(actor_model, ckp_data['model'])
+        load_model_state(critic_model, ckp_data['critic_model'])
         actor_optimizer.load_state_dict(ckp_data['optimizer'])
         critic_optimizer.load_state_dict(ckp_data['critic_optimizer'])
         actor_scheduler.load_state_dict(ckp_data['scheduler'])
         critic_scheduler.load_state_dict(ckp_data['critic_scheduler'])
         start_epoch = ckp_data['epoch']
         start_step = ckp_data.get('step', 0)
+        resume_rng_state_by_rank = ckp_data.get('rng_state_by_rank')
  
     # ========== 8. DDP ==========
     if dist.is_initialized():
@@ -776,11 +895,33 @@ if __name__ == "__main__":
  
     for epoch in range(start_epoch, args.epochs):
         train_sampler and train_sampler.set_epoch(epoch)
-        setup_seed(42 + epoch)
-        indices = torch.randperm(len(train_ds)).tolist()
+        train_ds.set_epoch(epoch)
+        setup_seed(42 + epoch * world_size + rank)
+        index_generator = torch.Generator()
+        index_generator.manual_seed(42 + epoch)
+        indices = torch.randperm(
+            len(train_ds), generator=index_generator
+        ).tolist()
         skip = start_step if (epoch == start_epoch and start_step > 0) else 0
         batch_sampler = SkipBatchSampler(train_sampler or indices, args.batch_size, skip)
-        loader = DataLoader(train_ds, batch_sampler=batch_sampler, num_workers=args.num_workers, pin_memory=True)
+        loader_generator = torch.Generator()
+        loader_generator.manual_seed(10_000 + epoch + rank)
+        loader = DataLoader(
+            train_ds,
+            batch_sampler=batch_sampler,
+            num_workers=args.num_workers,
+            pin_memory=True,
+            generator=loader_generator,
+        )
+
+        if ckp_data and epoch == start_epoch:
+            restored = restore_rng_state_for_rank(
+                resume_rng_state_by_rank,
+                device=args.device,
+                allow_missing=bool(args.allow_legacy_resume),
+            )
+            if not restored:
+                Logger("Legacy checkpoint has no RNG state; resume is not exact.")
  
         if skip > 0:
             Logger(f'Epoch [{epoch + 1}/{args.epochs}]: 跳过前{start_step}步, 从 step {start_step + 1} 开始')
@@ -791,20 +932,24 @@ if __name__ == "__main__":
                             actor_scheduler, critic_scheduler, reward_model, reward_tokenizer, 0, wandb)
  
     # 训练结束后总是保存一次
-    if is_main_process():
-        Logger("Training finished. Saving final checkpoint...")
-        actor_model.eval()
-        moe_suffix = '_moe' if lm_config.use_moe else ''
-        ckp = f'{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
-        raw_actor = actor_model.module if isinstance(actor_model, DistributedDataParallel) else actor_model
-        raw_actor = getattr(raw_actor, '_orig_mod', raw_actor)
-        actor_state = raw_actor.state_dict()
-        torch.save({k: v.half().cpu() for k, v in actor_state.items()}, ckp)
-        lm_checkpoint(lm_config, weight=args.save_weight, model=actor_model, optimizer=actor_optimizer,
-                      epoch=args.epochs, step=0, wandb=wandb, save_dir='checkpoints',
-                      scheduler=actor_scheduler, critic_model=critic_model,
-                      critic_optimizer=critic_optimizer, critic_scheduler=critic_scheduler)
-        Logger(f"Final model saved to {ckp}")
+    rng_state_by_rank = gather_rng_states(args.device)
+    Logger("Training finished. Saving final checkpoint...")
+    actor_model.eval()
+    moe_suffix = '_moe' if lm_config.use_moe else ''
+    ckp = f'{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth'
+    coordinated_checkpoint_save(
+        primary_save=lambda: lm_checkpoint(
+            lm_config, weight=args.save_weight, model=actor_model,
+            optimizer=actor_optimizer, epoch=args.epochs, step=0, wandb=wandb,
+            save_dir=args.checkpoint_dir, scheduler=actor_scheduler,
+            critic_model=critic_model, critic_optimizer=critic_optimizer,
+            critic_scheduler=critic_scheduler, metadata=checkpoint_metadata,
+            rng_state_by_rank=rng_state_by_rank, ref_model=ref_model,
+            save_inference=False,
+        ),
+        derived_save=lambda: save_inference_weights(actor_model, ckp),
+    )
+    Logger(f"Final model saved to {ckp}")
  
     # ========== 10. 清理 ==========
     if dist.is_initialized():

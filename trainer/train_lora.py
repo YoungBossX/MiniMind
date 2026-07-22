@@ -17,7 +17,11 @@ from trainer.trainer_utils import (get_lr, Logger, is_main_process, lm_checkpoin
                                    init_distributed_mode, setup_seed, init_model,
                                    accumulation_window_size,
                                    should_optimizer_step, checkpoint_due,
-                                   build_epoch_batch_sampler)
+                                   build_epoch_batch_sampler,
+                                   build_checkpoint_metadata, load_model_state,
+                                   resolve_checkpoint_dir,
+                                   resolve_lora_base_dirs,
+                                   coordinated_checkpoint_save)
 from trainer.path_utils import resolve_project_paths
 
 warnings.filterwarnings('ignore')
@@ -102,8 +106,7 @@ def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
                 wandb.log({"loss": current_loss, "lr": current_lr, "epoch_Time": eta_min})
 
         # 每save_interval步或最后一步保存一次
-        # is_main_process(): 只有主进程保存，避免多进程重复写入
-        if did_optimizer_step and checkpoint_due(step, iters, args.accumulation_steps, args.save_interval) and is_main_process():
+        if did_optimizer_step and checkpoint_due(step, iters, args.accumulation_steps, args.save_interval):
             model.eval() 
             # 只保存LoRA的A和B矩阵，不保存整个模型
             lora_save_path = (f"{args.save_dir}/{args.lora_name}_{lm_config.hidden_size}.pth")
@@ -111,21 +114,24 @@ def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
             # 从模型中提取所有包含'lora'的参数并保存
             # 文件大小通常只有Full SFT的1-5%
             raw_model = model.module if hasattr(model, "module") else model
-            save_lora(raw_model, lora_save_path)
-
             # 完整训练状态保存
             # 保存模型、优化器、scaler、训练进度等
             # 用于断点续训
-            lm_checkpoint(
-                lm_config,
-                weight=args.lora_name,
-                model=raw_model,
-                optimizer=optimizer,
-                scaler=scaler,
-                epoch=epoch,
-                step=step,
-                wandb=wandb,
-                save_dir="checkpoints",
+            coordinated_checkpoint_save(
+                primary_save=lambda: lm_checkpoint(
+                    lm_config,
+                    weight=args.lora_name,
+                    model=raw_model,
+                    optimizer=optimizer,
+                    scaler=scaler,
+                    epoch=epoch,
+                    step=step,
+                    wandb=wandb,
+                    save_dir=args.checkpoint_dir,
+                    metadata=checkpoint_metadata,
+                    save_inference=False,
+                ),
+                derived_save=lambda: save_lora(raw_model, lora_save_path),
             )
 
             model.train()
@@ -140,6 +146,9 @@ if __name__ == "__main__":
     # save_dir: 指定LoRA权重和检查点的保存目录
     # lora_name: LoRA权重的标识符，用于区分不同任务的LoRA适配器
     parser.add_argument("--save_dir", type=str, default="out/lora", help="LoRA权重保存目录")
+    parser.add_argument("--checkpoint_dir", type=str, default=None, help="LoRA 断点目录（默认 <save_dir>/checkpoints）")
+    parser.add_argument("--base_save_dir", type=str, default=None, help="基础全量权重目录（默认从 save_dir 推导）")
+    parser.add_argument("--base_checkpoint_dir", type=str, default=None, help="基础全量断点目录（默认 <base_save_dir>/checkpoints）")
     parser.add_argument("--lora_name", type=str, default="lora_identity", help="LoRA权重名称标识")
 
     # 📚 训练设备和精度配置
@@ -190,7 +199,8 @@ if __name__ == "__main__":
     # from_resume: 是否从检查点恢复训练，支持断点续训
     parser.add_argument("--data_path", type=str, default="dataset/lora_identity.jsonl", help="训练数据路径")
     parser.add_argument("--from_weight", default="full_sft", type=str, help="基于哪个权重训练，默认full_sft")
-    parser.add_argument("--from_resume", default=0, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
+    parser.add_argument("--from_resume", default=0, type=int, choices=[0, 1], help="是否显式从检查点续训（0=否，1=是）")
+    parser.add_argument("--allow_legacy_resume", default=0, type=int, choices=[0, 1], help="允许恢复缺少安全元数据的旧检查点")
 
     # 📚 实验跟踪配置
     # use_wandb: 是否启用WandB/SwanLab进行实验跟踪
@@ -199,7 +209,11 @@ if __name__ == "__main__":
     parser.add_argument("--wandb_project", type=str, default="MiniMind-LoRA", help="wandb项目名")
 
     args = parser.parse_args()
-    args = resolve_project_paths(args, "save_dir", "data_path")
+    args = resolve_project_paths(
+        args, "save_dir", "data_path", "checkpoint_dir",
+        "base_save_dir", "base_checkpoint_dir",
+    )
+    args.checkpoint_dir = resolve_checkpoint_dir(args.save_dir, args.checkpoint_dir)
 
     # ========== 1. 初始化环境和随机种子 ==========
     # 📚 分布式训练初始化
@@ -230,12 +244,19 @@ if __name__ == "__main__":
         num_hidden_layers=args.num_hidden_layers,
         use_moe=bool(args.use_moe),
     )
+    checkpoint_metadata = build_checkpoint_metadata(args, lm_config, "lora")
 
     # 📚 检查点检测
     # lm_checkpoint(): 检查是否存在可用的检查点
     # 如果from_resume=1，则尝试加载之前的训练状态
     ckp_data = (
-        lm_checkpoint(lm_config, weight=args.lora_name, save_dir="checkpoints")
+        lm_checkpoint(
+            lm_config,
+            weight=args.lora_name,
+            save_dir=args.checkpoint_dir,
+            expected_metadata=checkpoint_metadata,
+            allow_legacy_resume=bool(args.allow_legacy_resume),
+        )
         if args.from_resume == 1
         else None
     )
@@ -277,8 +298,14 @@ if __name__ == "__main__":
     # 📚 模型初始化
     # init_model(): 加载预训练模型和tokenizer
     # from_weight指定基础权重文件
-    base_save_dir = os.path.dirname(args.save_dir) if os.path.basename(args.save_dir) == "lora" else args.save_dir
-    model, tokenizer = init_model(lm_config, args.from_weight, save_dir=base_save_dir, device=args.device)
+    base_save_dir, base_checkpoint_dir = resolve_lora_base_dirs(
+        args.save_dir, args.base_save_dir, args.base_checkpoint_dir
+    )
+    model, tokenizer = init_model(
+        lm_config, args.from_weight, save_dir=base_save_dir,
+        resume_dir=base_checkpoint_dir, device=args.device,
+        allow_legacy_resume=bool(args.allow_legacy_resume),
+    )
 
     # 📚 应用LoRA适配器
     # apply_lora(): 在模型中注入LoRA参数
@@ -356,7 +383,7 @@ if __name__ == "__main__":
     # 支持断点续训，节省训练时间
     start_epoch, start_step = 0, 0
     if ckp_data:
-        model.load_state_dict(ckp_data["model"], strict=False)
+        load_model_state(model, ckp_data["model"], strict=True)
         optimizer.load_state_dict(ckp_data["optimizer"])
         scaler.load_state_dict(ckp_data["scaler"])
         start_epoch = ckp_data["epoch"]
@@ -397,3 +424,18 @@ if __name__ == "__main__":
             train_epoch(epoch, loader, len(loader) + start_step, lora_params, start_step=start_step, wandb=wandb)
         else:
             train_epoch(epoch, loader, len(loader), lora_params, 0, wandb)
+
+    Logger("Training finished. Saving final checkpoint...")
+    model.eval()
+    raw_model = model.module if hasattr(model, "module") else model
+    lora_save_path = f"{args.save_dir}/{args.lora_name}_{lm_config.hidden_size}.pth"
+    coordinated_checkpoint_save(
+        primary_save=lambda: lm_checkpoint(
+            lm_config, weight=args.lora_name, model=raw_model,
+            optimizer=optimizer, scaler=scaler, epoch=args.epochs, step=0,
+            wandb=wandb, save_dir=args.checkpoint_dir,
+            metadata=checkpoint_metadata, save_inference=False,
+        ),
+        derived_save=lambda: save_lora(raw_model, lora_save_path),
+    )
+    Logger(f"Final LoRA adapter saved to {lora_save_path}")

@@ -2,6 +2,7 @@ import torch
 import math
 from torch import optim, nn
 from torch.nn.init import kaiming_uniform_
+from trainer.trainer_utils import atomic_torch_save
 
 class LoRA(nn.Module):
     def __init__(self, in_features, out_features, rank=8, alpha=16):
@@ -68,4 +69,6 @@ def save_lora(model, path):
             clean_name = name[7:] if name.startswith("module.") else name
             lora_state = {f'{clean_name}.lora.{k}': v for k, v in module.lora.state_dict().items()}
             state_dict.update(lora_state)
-    torch.save(state_dict, path)
+    atomic_torch_save(
+        {key: value.detach().cpu() for key, value in state_dict.items()}, path
+    )

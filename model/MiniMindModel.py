@@ -270,14 +270,30 @@ class Attention(nn.Module):
             self.flash
             and (seq_len > 1)
             and (past_key_value is None)
-            and (attention_mask is None or torch.all(attention_mask == 1))
         ):
+            sdpa_mask = None
+            sdpa_is_causal = True
+            if attention_mask is not None:
+                key_padding_mask = attention_mask[:, -xk.size(-2):]
+                key_padding_mask = key_padding_mask[:, None, None, :].to(
+                    device=xq.device, dtype=torch.bool
+                )
+                query_length = xq.size(-2)
+                key_length = xk.size(-2)
+                causal_mask = torch.ones(
+                    (query_length, key_length),
+                    device=xq.device,
+                    dtype=torch.bool,
+                ).tril(diagonal=key_length - query_length)
+                sdpa_mask = key_padding_mask & causal_mask[None, None, :, :]
+                sdpa_is_causal = False
             output = F.scaled_dot_product_attention(
                 xq,
                 xk,
                 xv,
+                attn_mask=sdpa_mask,
                 dropout_p=self.dropout if self.training else 0.0,
-                is_causal=True,
+                is_causal=sdpa_is_causal,
             )
         # 否则，手动计算注意力分数，并应用掩码和 softmax
         else:
@@ -367,7 +383,11 @@ class MoEGate(nn.Module):
         # 权重初始化，使用 Kaiming 均匀分布，适合线性层的权重
         init.kaiming_uniform_(self.weight, a=math.sqrt(5))
     
-    def forward(self, hidden_states):
+    def forward(
+        self,
+        hidden_states,
+        attention_mask: Optional[torch.Tensor] = None,
+    ):
         # hidden_states shape: [batch_size, sequence_len, hidden_size]
         batch_size, sequence_len, hidden_size = hidden_states.shape
         # 把 batch 和 seq_len 合并，把每个 token 都当成独立样本处理
@@ -408,6 +428,17 @@ class MoEGate(nn.Module):
         # 因为这些专家更新更多，变得更强，形成马太效应
         # 辅助损失的目标：让每个专家被选中的频率尽量均等
         if self.training and self.alpha > 0.0:
+            if attention_mask is None:
+                token_mask = torch.ones(
+                    batch_size,
+                    sequence_len,
+                    dtype=torch.bool,
+                    device=hidden_states.device,
+                )
+            else:
+                token_mask = attention_mask.to(
+                    device=hidden_states.device, dtype=torch.bool
+                ).reshape(batch_size, sequence_len)
             # 保存完整的 scores 用于辅助损失计算
             scores_for_aux = scores
             aux_topk = self.top_k
@@ -418,10 +449,18 @@ class MoEGate(nn.Module):
                 # ── 方法A：序列级辅助损失（seq_aux=True，粒度更细）──────
                 # scores_for_seq_aux shape: [batch_size, sequence_len, n_routed_experts]
                 scores_for_seq_aux = scores_for_aux.view(batch_size, sequence_len, -1)
+                valid_tokens = token_mask.to(dtype=torch.float32)
+                valid_counts = valid_tokens.sum(dim=1, keepdim=True)
+                topk_token_mask = valid_tokens.unsqueeze(-1).expand(
+                    -1, -1, aux_topk
+                ).reshape(batch_size, -1)
                 # ce：统计每个 batch 中每个专家被选中了多少次
                 # shape: [batch_size, n_routed_experts]，初始化为全 0
                 ce = torch.zeros(
-                    batch_size, self.n_routed_experts, device=hidden_states.device
+                    batch_size,
+                    self.n_routed_experts,
+                    dtype=torch.float32,
+                    device=hidden_states.device,
                 )
                 # scatter_add_：在 dim=1（专家维度）上累加计数
                 # topk_idx_for_aux_loss 是每个 token 选中的专家编号
@@ -432,27 +471,49 @@ class MoEGate(nn.Module):
                 ce.scatter_add_(
                     1,
                     topk_idx_for_aux_loss,
-                    torch.ones(batch_size, sequence_len * aux_topk, device=hidden_states.device),
-                ).div_(sequence_len * aux_topk / self.n_routed_experts)
+                    topk_token_mask,
+                )
+                expected_load = valid_counts * aux_topk / self.n_routed_experts
+                safe_expected_load = torch.where(
+                    expected_load > 0,
+                    expected_load,
+                    torch.ones_like(expected_load),
+                )
+                ce.div_(safe_expected_load)
                 # aux_loss = mean(每个专家的平均路由概率 × 相对负载)
                 # 专家被选得越多 且 得分越高 → aux_loss 越大 → 梯度会推动门控分散
-                # scores_for_seq_aux.mean(dim=1) shape: [batch_size, n_routed_experts]
-                aux_loss = (ce * scores_for_seq_aux.mean(dim=1)).sum(
-                    dim=1
-                ).mean() * self.alpha
+                # Padding does not contribute to route counts or mean scores.
+                mean_scores = (
+                    scores_for_seq_aux * valid_tokens.unsqueeze(-1)
+                ).sum(dim=1) / valid_counts.clamp_min(1.0)
+                per_sequence_loss = (ce * mean_scores).sum(dim=1)
+                valid_sequences = (valid_counts.squeeze(1) > 0).to(
+                    dtype=torch.float32
+                )
+                aux_loss = (
+                    (per_sequence_loss * valid_sequences).sum()
+                    / valid_sequences.sum().clamp_min(1.0)
+                    * self.alpha
+                )
             else:
                 # ── 方法B：token 级辅助损失（seq_aux=False，DeepSeek 原版）─
                 # mask_ce：one-hot 编码，每行代表一个（token, 专家）的选中情况
-                # shape: [batch_size * sequence_len * top_k, n_routed_experts]
+                # shape: [batch_size * sequence_len, top_k, n_routed_experts]
+                valid_tokens = token_mask.reshape(-1).to(dtype=torch.float32)
+                valid_count = valid_tokens.sum().clamp_min(1.0)
                 mask_ce = F.one_hot(
-                    topk_idx_for_aux_loss.view(-1), num_classes=self.n_routed_experts
-                )
-                # ce：每个专家被选中的频率（在所有 token 中的比例）
+                    topk_idx, num_classes=self.n_routed_experts
+                ).to(dtype=torch.float32)
+                # ce：每个专家在有效 token 中被选中的频率
                 # shape: [n_routed_experts]
-                ce = mask_ce.float().mean(0)
+                ce = (
+                    mask_ce * valid_tokens[:, None, None]
+                ).sum(dim=(0, 1)) / (valid_count * aux_topk)
                 # Pi：每个专家的平均路由概率（软概率，可微）
                 # shape: [n_routed_experts]
-                Pi = scores_for_aux.mean(0)
+                Pi = (
+                    scores_for_aux * valid_tokens.unsqueeze(-1)
+                ).sum(dim=0) / valid_count
                 # fi：实际负载（硬选择频率 × 专家数 = 归一化后的负载系数）
                 # 理想情况每个 fi = 1.0，如果某个专家被选得过多，fi 会大于 1，产生更大的惩罚
                 fi = ce * self.n_routed_experts
@@ -499,7 +560,11 @@ class MoEFeedForward(nn.Module):
                 [FeedForward(config) for _ in range(config.n_shared_experts)]
             )
 
-    def forward(self, x):
+    def forward(
+        self,
+        x,
+        attention_mask: Optional[torch.Tensor] = None,
+    ):
         identity = x # 保存原始输入，用于后面加共享专家的输出
         orig_shape = x.shape # 记录原始形状，最后需要恢复
         batch_size, sequence_len, hidden_size = orig_shape  # batch_size, 序列长度, 隐藏维度
@@ -508,7 +573,9 @@ class MoEFeedForward(nn.Module):
         # topk_idx    shape: [batch_size * sequence_len, top_k]  被选中的专家编号
         # topk_weight shape: [batch_size * sequence_len, top_k]  对应的路由权重（归一化后之和=1）
         # aux_loss    : 标量，负载均衡损失
-        topk_idx, topk_weight, aux_loss = self.gate(x)
+        topk_idx, topk_weight, aux_loss = self.gate(
+            x, attention_mask=attention_mask
+        )
 
         # 将 x 展平：[batch_size, sequence_len, hidden_size] → [batch_size * sequence_len, hidden_size]
         # 之后把每个 token 当作独立样本处理
@@ -684,9 +751,18 @@ class MiniMindBlock(nn.Module):
         hidden_states = res + hidden_states
 
         # 2. FFN 子层（Pre-Norm + 残差）
-        hidden_states = hidden_states + self.mlp(
-            self.post_attention_layernorm(hidden_states)
-        )
+        normalized_hidden_states = self.post_attention_layernorm(hidden_states)
+        if isinstance(self.mlp, MoEFeedForward):
+            query_attention_mask = None
+            if attention_mask is not None:
+                query_attention_mask = attention_mask[:, -hidden_states.size(1):]
+            mlp_output = self.mlp(
+                normalized_hidden_states,
+                attention_mask=query_attention_mask,
+            )
+        else:
+            mlp_output = self.mlp(normalized_hidden_states)
+        hidden_states = hidden_states + mlp_output
 
         return hidden_states, present_key_value
     

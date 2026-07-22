@@ -16,7 +16,10 @@ from dataset.llm_dataset import SFTDataset, dynamic_padding_collate
 from trainer.trainer_utils import (get_lr, Logger, is_main_process, lm_checkpoint,
                                    init_distributed_mode, setup_seed, init_model,
                                    build_epoch_batch_sampler, accumulation_window_size,
-                                   should_optimizer_step, checkpoint_due)
+                                   should_optimizer_step, checkpoint_due,
+                                   build_checkpoint_metadata, load_model_state,
+                                   save_inference_weights, resolve_checkpoint_dir,
+                                   coordinated_checkpoint_save)
 from trainer.path_utils import resolve_project_paths
 
 warnings.filterwarnings('ignore')
@@ -67,33 +70,31 @@ def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
             
             if wandb: wandb.log({"loss": current_loss, "logits_loss": current_logits_loss, "aux_loss": current_aux_loss, "learning_rate": current_lr, "epoch_time": eta_min})
 
-        if did_optimizer_step and checkpoint_due(step, iters, args.accumulation_steps, args.save_interval) and is_main_process():
+        if did_optimizer_step and checkpoint_due(step, iters, args.accumulation_steps, args.save_interval):
             model.eval()
 
             moe_suffix = "_moe" if lm_config.use_moe else ""
 
             ckp = f"{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth"
 
-            raw_model = (model.module if isinstance(model, DistributedDataParallel) else model)
-            raw_model = getattr(raw_model, "_orig_mod", raw_model)
-            state_dict = raw_model.state_dict()
-
-            torch.save({k: v.half().cpu() for k, v in state_dict.items()}, ckp)
-
-            lm_checkpoint(
-                lm_config,
-                weight=args.save_weight,
-                model=model,
-                optimizer=optimizer,
-                epoch=epoch,
-                step=step,
-                wandb=wandb,
-                save_dir="checkpoints",
-                scaler=scaler,
+            coordinated_checkpoint_save(
+                primary_save=lambda: lm_checkpoint(
+                    lm_config,
+                    weight=args.save_weight,
+                    model=model,
+                    optimizer=optimizer,
+                    epoch=epoch,
+                    step=step,
+                    wandb=wandb,
+                    save_dir=args.checkpoint_dir,
+                    scaler=scaler,
+                    metadata=checkpoint_metadata,
+                    save_inference=False,
+                ),
+                derived_save=lambda: save_inference_weights(model, ckp),
             )
 
             model.train()
-            del state_dict
 
         del input_ids, labels, loss_mask, attention_mask, res, loss
 
@@ -101,6 +102,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="MiniMind Full SFT")
     # ========== 基础训练参数 ==========
     parser.add_argument("--save_dir", type=str, default="out", help="模型保存目录")
+    parser.add_argument("--checkpoint_dir", type=str, default=None, help="断点续训目录（默认 <save_dir>/checkpoints）")
     parser.add_argument("--save_weight", default="full_sft", type=str, help="保存权重的前缀名")
     parser.add_argument("--epochs", type=int, default=2, help="训练轮数（建议1轮zero或2-6轮充分训练）")
     parser.add_argument("--batch_size", type=int, default=16, help="batch size")
@@ -120,13 +122,14 @@ if __name__ == "__main__":
     # ========== 模型架构参数 ==========
     parser.add_argument("--hidden_size", default=512, type=int, help="隐藏层维度")
     parser.add_argument("--num_hidden_layers", default=8, type=int, help="隐藏层数量")
-    parser.add_argument("--max_seq_len", default=340, type=int, help="训练的最大截断长度")
+    parser.add_argument("--max_seq_len", default=512, type=int, help="训练的最大截断长度")
     parser.add_argument("--use_moe", default=0, type=int, choices=[0, 1], help="是否使用MoE架构（0=否，1=是）")
 
     # ========== 数据和恢复参数 ==========
     parser.add_argument("--data_path", type=str, default="dataset/sft_mini_512.jsonl", help="预训练数据路径")
     parser.add_argument("--from_weight", default="pretrain", type=str, help="基于哪个权重训练，为none则从头开始")
-    parser.add_argument("--from_resume", default=1, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
+    parser.add_argument("--from_resume", default=0, type=int, choices=[0, 1], help="是否显式从检查点续训（0=否，1=是）")
+    parser.add_argument("--allow_legacy_resume", default=0, type=int, choices=[0, 1], help="允许恢复缺少安全元数据的旧检查点")
 
     # ========== 实验跟踪参数 ==========
     parser.add_argument("--use_wandb", action="store_true", help="是否使用wandb")
@@ -135,7 +138,8 @@ if __name__ == "__main__":
 
     # 解析命令行参数
     args = parser.parse_args()
-    args = resolve_project_paths(args, "save_dir", "data_path")
+    args = resolve_project_paths(args, "save_dir", "data_path", "checkpoint_dir")
+    args.checkpoint_dir = resolve_checkpoint_dir(args.save_dir, args.checkpoint_dir)
 
     # ========== 1. 初始化环境和随机种子 ==========
     """
@@ -160,9 +164,16 @@ if __name__ == "__main__":
         num_hidden_layers=args.num_hidden_layers,
         use_moe=bool(args.use_moe),
     )
+    checkpoint_metadata = build_checkpoint_metadata(args, lm_config, "full_sft")
     # 尝试加载断点续训数据
     ckp_data = (
-        lm_checkpoint(lm_config, weight=args.save_weight, save_dir="checkpoints")
+        lm_checkpoint(
+            lm_config,
+            weight=args.save_weight,
+            save_dir=args.checkpoint_dir,
+            expected_metadata=checkpoint_metadata,
+            allow_legacy_resume=bool(args.allow_legacy_resume),
+        )
         if args.from_resume == 1
         else None
     )
@@ -204,7 +215,11 @@ if __name__ == "__main__":
     - SFT: SFTDataset - 监督微调数据集，包含instruction和response
     - Pretrain: PretrainDataset - 预训练数据集，包含原始文本和mask
     """
-    model, tokenizer = init_model(lm_config, args.from_weight, save_dir=args.save_dir, device=args.device)
+    model, tokenizer = init_model(
+        lm_config, args.from_weight, save_dir=args.save_dir,
+        resume_dir=args.checkpoint_dir, device=args.device,
+        allow_legacy_resume=bool(args.allow_legacy_resume),
+    )
 
     # 📚 torch.compile加速：JIT编译模型获得20%~40%性能提升
     if args.use_compile == 1:
@@ -230,7 +245,7 @@ if __name__ == "__main__":
     """
     start_epoch, start_step = 0, 0
     if ckp_data:
-        model.load_state_dict(ckp_data["model"])
+        load_model_state(model, ckp_data["model"])
         optimizer.load_state_dict(ckp_data["optimizer"])
         scaler.load_state_dict(ckp_data["scaler"])
         start_epoch = ckp_data["epoch"]
@@ -275,6 +290,21 @@ if __name__ == "__main__":
             train_epoch(epoch, loader, len(loader) + skip, start_step, wandb)
         else:
             train_epoch(epoch, loader, len(loader), 0, wandb)
+
+    Logger("Training finished. Saving final checkpoint...")
+    model.eval()
+    moe_suffix = "_moe" if lm_config.use_moe else ""
+    ckp = f"{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth"
+    coordinated_checkpoint_save(
+        primary_save=lambda: lm_checkpoint(
+            lm_config, weight=args.save_weight, model=model, optimizer=optimizer,
+            scaler=scaler, epoch=args.epochs, step=0, wandb=wandb,
+            save_dir=args.checkpoint_dir, metadata=checkpoint_metadata,
+            save_inference=False,
+        ),
+        derived_save=lambda: save_inference_weights(model, ckp),
+    )
+    Logger(f"Final model saved to {ckp}")
 
     # ========== 9. 清理分布式进程 ==========
     if dist.is_initialized():

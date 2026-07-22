@@ -18,7 +18,13 @@ from trainer.trainer_utils import (get_lr, Logger, is_main_process, lm_checkpoin
                                    init_distributed_mode, setup_seed, init_model,
                                    accumulation_window_size,
                                    should_optimizer_step, checkpoint_due,
-                                   build_epoch_batch_sampler)
+                                   build_epoch_batch_sampler,
+                                   build_checkpoint_metadata, load_model_state,
+                                   save_inference_weights,
+                                   init_reference_model,
+                                   synchronize_model_state,
+                                   resolve_checkpoint_dir,
+                                   coordinated_checkpoint_save)
 from trainer.path_utils import resolve_project_paths
 
 warnings.filterwarnings('ignore')
@@ -284,31 +290,28 @@ def train_epoch(epoch, loader, iters, ref_model, lm_config, start_step=0, wandb=
                 wandb.log({"loss": current_loss, "lr": current_lr, "epoch_Time": eta_min})
 
         # ── 模型保存 ──────────────────────────────────────────────────
-        if did_optimizer_step and checkpoint_due(step, iters, args.accumulation_steps, args.save_interval) and is_main_process():
+        if did_optimizer_step and checkpoint_due(step, iters, args.accumulation_steps, args.save_interval):
             model.eval()
             moe_suffix = "_moe" if lm_config.use_moe else ""
             ckp = f"{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth"
  
-            # 取出原始模型（DDP 封装时需要 .module）
-            state_dict = (
-                model.module.state_dict()
-                if isinstance(model, torch.nn.parallel.DistributedDataParallel)
-                else model.state_dict()
-            )
-            # 半精度保存，减小文件体积
-            torch.save({k: v.half() for k, v in state_dict.items()}, ckp)
- 
             # 保存完整训练状态（用于断点续训）
-            lm_checkpoint(
-                lm_config,
-                weight=args.save_weight,
-                model=model,
-                optimizer=optimizer,
-                scaler=scaler,
-                epoch=epoch,
-                step=step,
-                wandb=wandb,
-                save_dir="checkpoints",
+            coordinated_checkpoint_save(
+                primary_save=lambda: lm_checkpoint(
+                    lm_config,
+                    weight=args.save_weight,
+                    model=model,
+                    optimizer=optimizer,
+                    scaler=scaler,
+                    epoch=epoch,
+                    step=step,
+                    wandb=wandb,
+                    save_dir=args.checkpoint_dir,
+                    metadata=checkpoint_metadata,
+                    ref_model=ref_model,
+                    save_inference=False,
+                ),
+                derived_save=lambda: save_inference_weights(model, ckp),
             )
             model.train()
 
@@ -322,6 +325,7 @@ if __name__ == "__main__":
     # save_dir: 指定LoRA权重和检查点的保存目录
     # lora_name: LoRA权重的标识符，用于区分不同任务的LoRA适配器
     parser.add_argument("--save_dir", type=str, default="out", help="DPO权重保存目录")
+    parser.add_argument("--checkpoint_dir", type=str, default=None, help="断点续训目录（默认 <save_dir>/checkpoints）")
     parser.add_argument("--save_weight", type=str, default="dpo", help="保存权重的前缀名")
 
     # 📚 训练设备和精度配置
@@ -334,9 +338,8 @@ if __name__ == "__main__":
     # epochs: 训练的总轮数，控制模型训练的完整程度
     # batch_size: 每个批次的样本数量，影响显存使用和训练稳定性
     # learning_rate: 初始学习率，控制参数更新的步长
-    # DPO 学习率要远小于 SFT（建议 ≤ 5e-8）
-    # 太大会导致策略模型遗忘 SFT 阶段学到的知识
-    parser.add_argument("--learning_rate", type=float, default=4e-8, help="初始学习率")
+    # 默认采用项目验证过的 1e-6 配方；若数据规模或偏好噪声变化，应重新调参。
+    parser.add_argument("--learning_rate", type=float, default=1e-6, help="初始学习率")
     parser.add_argument("--epochs", type=int, default=1, help="训练轮数")
     parser.add_argument("--batch_size", type=int, default=4, help="batch size")
     # beta：控制偏离参考模型的惩罚力度
@@ -383,7 +386,8 @@ if __name__ == "__main__":
     parser.add_argument("--data_path", type=str, default="dataset/dpo.jsonl", help="训练数据路径")
     # DPO 基于 SFT 模型进行对齐优化，from_weight 通常是 "full_sft"
     parser.add_argument("--from_weight", default="full_sft", type=str, help="基于哪个权重训练，默认full_sft")
-    parser.add_argument("--from_resume", default=1, type=int, choices=[0, 1], help="是否自动检测&续训（0=否，1=是）")
+    parser.add_argument("--from_resume", default=0, type=int, choices=[0, 1], help="是否显式从检查点续训（0=否，1=是）")
+    parser.add_argument("--allow_legacy_resume", default=0, type=int, choices=[0, 1], help="允许恢复缺少安全元数据的旧检查点")
 
     # 📚 实验跟踪配置
     # use_wandb: 是否启用WandB/SwanLab进行实验跟踪
@@ -392,7 +396,8 @@ if __name__ == "__main__":
     parser.add_argument("--wandb_project", type=str, default="MiniMind-LoRA", help="wandb项目名")
 
     args = parser.parse_args()
-    args = resolve_project_paths(args, "save_dir", "data_path")
+    args = resolve_project_paths(args, "save_dir", "data_path", "checkpoint_dir")
+    args.checkpoint_dir = resolve_checkpoint_dir(args.save_dir, args.checkpoint_dir)
 
     # ========== 1. 初始化环境和随机种子 ==========
     # 📚 分布式训练初始化
@@ -423,12 +428,19 @@ if __name__ == "__main__":
         num_hidden_layers=args.num_hidden_layers,
         use_moe=bool(args.use_moe),
     )
+    checkpoint_metadata = build_checkpoint_metadata(args, lm_config, "dpo")
 
     # 📚 检查点检测
     # lm_checkpoint(): 检查是否存在可用的检查点
     # 如果from_resume=1，则尝试加载之前的训练状态
     ckp_data = (
-        lm_checkpoint(lm_config, weight=args.save_weight, save_dir="checkpoints")
+        lm_checkpoint(
+            lm_config,
+            weight=args.save_weight,
+            save_dir=args.checkpoint_dir,
+            expected_metadata=checkpoint_metadata,
+            allow_legacy_resume=bool(args.allow_legacy_resume),
+        )
         if args.from_resume == 1
         else None
     )
@@ -470,13 +482,28 @@ if __name__ == "__main__":
     # 📚 模型初始化
     # init_model(): 加载预训练模型和tokenizer
     # from_weight指定基础权重文件
-    model, tokenizer = init_model(lm_config, args.from_weight, save_dir=args.save_dir, device=args.device)
+    model, tokenizer = init_model(
+        lm_config, args.from_weight, save_dir=args.save_dir,
+        resume_dir=args.checkpoint_dir, device=args.device,
+        allow_legacy_resume=bool(args.allow_legacy_resume),
+    )
     Logger(f"策略模型总参数量：{sum(p.numel() for p in model.parameters()) / 1e6:.3f} M")
 
     # 参考模型（reference model）：冻结的 baseline
     # 与策略模型初始权重完全相同，但整个训练过程不更新
     # 作用：正则化项，防止策略模型过度优化偏好而遗忘语言能力
-    ref_model, _ = init_model(lm_config, args.from_weight, save_dir=args.save_dir, device=args.device)
+    ref_model, restored_ref = init_reference_model(
+        lm_config,
+        args.from_weight,
+        checkpoint=ckp_data,
+        save_dir=args.save_dir,
+        checkpoint_dir=args.checkpoint_dir,
+        device=args.device,
+        allow_legacy_resume=bool(args.allow_legacy_resume),
+    )
+    if ckp_data and not restored_ref:
+        Logger("Legacy checkpoint has no frozen reference snapshot.")
+    synchronize_model_state(ref_model)
     ref_model.eval() # 切换到推理模式（关闭 dropout 等）
     ref_model.requires_grad_(False) # 冻结所有参数，不参与反向传播
     Logger(f"参考模型总参数量：{sum(p.numel() for p in ref_model.parameters()) / 1e6:.3f} M")
@@ -492,7 +519,7 @@ if __name__ == "__main__":
     # ========== 7. 从检查点恢复训练状态 ==========
     start_epoch, start_step = 0, 0
     if ckp_data:
-        model.load_state_dict(ckp_data["model"])
+        load_model_state(model, ckp_data["model"])
         optimizer.load_state_dict(ckp_data["optimizer"])
         scaler.load_state_dict(ckp_data["scaler"])
         start_epoch = ckp_data["epoch"]
@@ -530,3 +557,18 @@ if __name__ == "__main__":
             train_epoch(epoch, loader, len(loader) + start_step, ref_model, lm_config, start_step, wandb, args.beta)
         else:
             train_epoch(epoch, loader, len(loader), ref_model, lm_config, 0, wandb, args.beta)
+
+    Logger("Training finished. Saving final checkpoint...")
+    model.eval()
+    moe_suffix = "_moe" if lm_config.use_moe else ""
+    ckp = f"{args.save_dir}/{args.save_weight}_{lm_config.hidden_size}{moe_suffix}.pth"
+    coordinated_checkpoint_save(
+        primary_save=lambda: lm_checkpoint(
+            lm_config, weight=args.save_weight, model=model, optimizer=optimizer,
+            scaler=scaler, epoch=args.epochs, step=0, wandb=wandb,
+            save_dir=args.checkpoint_dir, metadata=checkpoint_metadata,
+            ref_model=ref_model, save_inference=False,
+        ),
+        derived_save=lambda: save_inference_weights(model, ckp),
+    )
+    Logger(f"Final model saved to {ckp}")

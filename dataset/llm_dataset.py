@@ -8,6 +8,8 @@ from datasets import load_dataset
 # 禁用 HuggingFace tokenizer 的多进程并行，避免在 DataLoader 多进程环境中产生死锁
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
+_CHATML_RESERVED_DELIMITERS = ("<|im_start|>", "<|im_end|>")
+
 
 def _approximate_text_length(text):
     """Cheap length signal used only to locally group offline training samples."""
@@ -24,6 +26,350 @@ def _approximate_conversation_length(conversations):
             if isinstance(turn, dict)
         ),
     )
+
+
+def _find_last_subsequence(sequence, pattern):
+    if not pattern or len(pattern) > len(sequence):
+        return -1
+    for index in range(len(sequence) - len(pattern), -1, -1):
+        if sequence[index:index + len(pattern)] == pattern:
+            return index
+    return -1
+
+
+def _reject_reserved_chatml_content(conversations, sample_name):
+    """Reject unescaped delimiters before the chat template adds boundaries."""
+    for turn_index, turn in enumerate(conversations):
+        if not isinstance(turn, dict):
+            continue
+        content = turn.get("content")
+        if not isinstance(content, str):
+            continue
+        for delimiter in _CHATML_RESERVED_DELIMITERS:
+            if delimiter in content:
+                raise ValueError(
+                    f"{sample_name} turn {turn_index} contains reserved "
+                    f"ChatML delimiter {delimiter!r}"
+                )
+
+
+def _validate_chatml_start_boundaries(
+    input_ids, message_start_id, eos_id, sample_name
+):
+    """Require every rendered ChatML start marker to follow a legal boundary."""
+    for index in range(len(input_ids) - len(message_start_id) + 1):
+        if input_ids[index:index + len(message_start_id)] != message_start_id:
+            continue
+        if index == 0 or (
+            index >= len(eos_id)
+            and input_ids[index - len(eos_id):index] == eos_id
+        ):
+            continue
+        raise ValueError(
+            f"{sample_name} contains an unbounded reserved ChatML delimiter"
+        )
+
+
+def _assistant_loss_mask(input_ids, assistant_start_id, eos_id, max_length):
+    """Mask assistant spans whose headers begin at valid ChatML boundaries."""
+    loss_mask = [0] * len(input_ids)
+    index = 0
+    while index < len(input_ids):
+        is_assistant_header = (
+            input_ids[index:index + len(assistant_start_id)]
+            == assistant_start_id
+        )
+        has_valid_boundary = index == 0 or (
+            index >= len(eos_id)
+            and input_ids[index - len(eos_id):index] == eos_id
+        )
+        if not is_assistant_header or not has_valid_boundary:
+            index += 1
+            continue
+
+        content_start = index + len(assistant_start_id)
+        content_end = content_start
+        while content_end < len(input_ids):
+            if input_ids[content_end:content_end + len(eos_id)] == eos_id:
+                break
+            content_end += 1
+        span_end = min(content_end + len(eos_id), max_length, len(input_ids))
+        for token_index in range(content_start, span_end):
+            loss_mask[token_index] = 1
+        index = span_end if span_end > index else index + 1
+    return loss_mask
+
+
+def _find_last_bounded_subsequence(sequence, pattern, eos_id):
+    """Find a marker that begins the sequence or follows a ChatML EOS."""
+    if not pattern or len(pattern) > len(sequence):
+        return -1
+    for index in range(len(sequence) - len(pattern), -1, -1):
+        if sequence[index:index + len(pattern)] != pattern:
+            continue
+        if index == 0 or (
+            eos_id
+            and index >= len(eos_id)
+            and sequence[index - len(eos_id):index] == eos_id
+        ):
+            return index
+    return -1
+
+
+def _chatml_message_parts(message, message_start_id, header_end_id, eos_id):
+    """Return a complete ChatML message's header and content token slices."""
+    message = list(message)
+    if (
+        not message_start_id
+        or not header_end_id
+        or not eos_id
+        or message[:len(message_start_id)] != message_start_id
+        or message[-len(eos_id):] != eos_id
+    ):
+        return None
+
+    search_start = max(len(message_start_id) - len(header_end_id), 0)
+    eos_start = len(message) - len(eos_id)
+    for index in range(search_start, eos_start - len(header_end_id) + 1):
+        if message[index:index + len(header_end_id)] == header_end_id:
+            content_start = index + len(header_end_id)
+            return message[:content_start], message[content_start:eos_start]
+    return None
+
+
+def _chatml_message_min_length(message, message_start_id, header_end_id, eos_id):
+    parts = _chatml_message_parts(
+        message, message_start_id, header_end_id, eos_id
+    )
+    if parts is None:
+        return 0
+    header, content = parts
+    return len(header) + len(eos_id) + int(bool(content))
+
+
+def _truncate_chatml_message_tail(
+    message,
+    message_start_id,
+    header_end_id,
+    eos_id,
+    max_length,
+):
+    """Keep a valid message header, its newest content tokens, and full EOS."""
+    parts = _chatml_message_parts(
+        message, message_start_id, header_end_id, eos_id
+    )
+    if parts is None:
+        return []
+    header, content = parts
+    content_budget = max_length - len(header) - len(eos_id)
+    minimum_content = int(bool(content))
+    if content_budget < minimum_content:
+        return []
+    if len(content) > content_budget:
+        content = content[-content_budget:] if content_budget else []
+    return header + content + eos_id
+
+
+def _bounded_message_starts(sequence, message_start_id, eos_id):
+    starts = []
+    for index in range(len(sequence) - len(message_start_id) + 1):
+        if sequence[index:index + len(message_start_id)] != message_start_id:
+            continue
+        if index == 0 or (
+            eos_id
+            and index >= len(eos_id)
+            and sequence[index - len(eos_id):index] == eos_id
+        ):
+            starts.append(index)
+    return starts
+
+
+def _latest_chatml_message_min_length(
+    prefix, message_start_id, header_end_id, eos_id
+):
+    starts = _bounded_message_starts(prefix, message_start_id, eos_id)
+    if not starts:
+        return 0
+    return _chatml_message_min_length(
+        prefix[starts[-1]:], message_start_id, header_end_id, eos_id
+    )
+
+
+def _complete_chatml_prefix_suffix(
+    prefix,
+    message_start_id,
+    header_end_id,
+    eos_id,
+    max_length,
+):
+    """Return the newest complete ChatML context that fits ``max_length``."""
+    if max_length <= 0:
+        return []
+
+    starts = _bounded_message_starts(prefix, message_start_id, eos_id)
+    if not starts:
+        return []
+
+    best_suffix = []
+    for index in reversed(starts):
+        candidate = prefix[index:]
+        if len(candidate) > max_length:
+            break
+        best_suffix = candidate
+    if best_suffix:
+        return best_suffix
+
+    return _truncate_chatml_message_tail(
+        prefix[starts[-1]:],
+        message_start_id,
+        header_end_id,
+        eos_id,
+        max_length,
+    )
+
+
+def _split_final_assistant(input_ids, bos_id, eos_id):
+    input_ids = list(input_ids)
+    assistant_start = _find_last_bounded_subsequence(input_ids, bos_id, eos_id)
+    final_message_start = _find_last_bounded_subsequence(
+        input_ids, bos_id[:1], eos_id
+    )
+    if assistant_start < 0 or assistant_start != final_message_start:
+        return input_ids, None
+
+    content_start = assistant_start + len(bos_id)
+    eos_start = _find_last_subsequence(input_ids, eos_id)
+
+    target_content = (
+        input_ids[content_start:]
+        if eos_start < content_start
+        else input_ids[content_start:eos_start]
+    )
+    assistant_segment = bos_id + target_content + eos_id
+    return input_ids[:assistant_start], assistant_segment
+
+
+def _truncate_assistant_segment(assistant_segment, bos_id, eos_id, max_length):
+    truncated = _truncate_chatml_message_tail(
+        assistant_segment,
+        bos_id,
+        bos_id[-1:],
+        eos_id,
+        max_length,
+    )
+    if not truncated:
+        raise ValueError(
+            "max_length is too small for assistant content and ChatML boundaries"
+        )
+    return truncated
+
+
+def _truncate_preserving_final_assistant(input_ids, bos_id, eos_id, max_length):
+    """Keep the final assistant target and as much recent context as fits."""
+    input_ids = list(input_ids)
+    if len(input_ids) <= max_length:
+        return input_ids
+
+    prefix, assistant_segment = _split_final_assistant(input_ids, bos_id, eos_id)
+    if assistant_segment is None:
+        return input_ids[:max_length]
+
+    message_start_id = bos_id[:1]
+    header_end_id = bos_id[-1:]
+    prefix_min_length = _latest_chatml_message_min_length(
+        prefix, message_start_id, header_end_id, eos_id
+    )
+    assistant_min_length = _chatml_message_min_length(
+        assistant_segment, bos_id, header_end_id, eos_id
+    )
+    prefix_reserve = (
+        prefix_min_length
+        if (
+            prefix_min_length
+            and max_length >= prefix_min_length + assistant_min_length
+        )
+        else 0
+    )
+    assistant_segment = _truncate_assistant_segment(
+        assistant_segment, bos_id, eos_id, max_length - prefix_reserve
+    )
+    prefix_budget = max_length - len(assistant_segment)
+    complete_prefix = _complete_chatml_prefix_suffix(
+        prefix,
+        message_start_id,
+        header_end_id,
+        eos_id,
+        prefix_budget,
+    )
+    return complete_prefix + assistant_segment
+
+
+def _truncate_dpo_pair(chosen_ids, rejected_ids, bos_id, eos_id, max_length):
+    chosen_prefix, chosen_segment = _split_final_assistant(
+        chosen_ids, bos_id, eos_id
+    )
+    rejected_prefix, rejected_segment = _split_final_assistant(
+        rejected_ids, bos_id, eos_id
+    )
+    if chosen_segment is None or rejected_segment is None:
+        return (
+            _truncate_preserving_final_assistant(
+                chosen_ids, bos_id, eos_id, max_length
+            ),
+            _truncate_preserving_final_assistant(
+                rejected_ids, bos_id, eos_id, max_length
+            ),
+        )
+    if chosen_prefix != rejected_prefix:
+        raise ValueError("DPO chosen and rejected branches must share one prompt")
+
+    message_start_id = bos_id[:1]
+    header_end_id = bos_id[-1:]
+    prefix_min_length = _latest_chatml_message_min_length(
+        chosen_prefix, message_start_id, header_end_id, eos_id
+    )
+    assistant_min_length = max(
+        _chatml_message_min_length(
+            chosen_segment, bos_id, header_end_id, eos_id
+        ),
+        _chatml_message_min_length(
+            rejected_segment, bos_id, header_end_id, eos_id
+        ),
+    )
+    prefix_reserve = (
+        prefix_min_length
+        if (
+            prefix_min_length
+            and max_length >= prefix_min_length + assistant_min_length
+        )
+        else 0
+    )
+    assistant_budget = max_length - prefix_reserve
+    chosen_segment = _truncate_assistant_segment(
+        chosen_segment, bos_id, eos_id, assistant_budget
+    )
+    rejected_segment = _truncate_assistant_segment(
+        rejected_segment, bos_id, eos_id, assistant_budget
+    )
+    prefix_budget = max_length - max(len(chosen_segment), len(rejected_segment))
+    common_prefix = _complete_chatml_prefix_suffix(
+        chosen_prefix,
+        message_start_id,
+        header_end_id,
+        eos_id,
+        prefix_budget,
+    )
+    return common_prefix + chosen_segment, common_prefix + rejected_segment
+
+
+def _pad_token_ids(input_ids, max_length, pad_token_id):
+    input_ids = list(input_ids[:max_length])
+    attention_mask = [1] * len(input_ids)
+    padding = max_length - len(input_ids)
+    if padding:
+        input_ids.extend([pad_token_id] * padding)
+        attention_mask.extend([0] * padding)
+    return input_ids, attention_mask
 
 
 def dynamic_padding_collate(batch):
@@ -82,8 +428,9 @@ def pre_processing_chat(conversations, add_system_ratio=0.2):
             return [{'role': 'system', 'content': random.choice(SYSTEM_PROMPTS)}] + conversations
     return conversations
 
-def post_processing_chat(prompt_content, empty_think_ratio=0.05):
-    if '<think>\n\n</think>\n\n' in prompt_content and random.random() > empty_think_ratio:
+def post_processing_chat(prompt_content, empty_think_ratio=0.05, rng=None):
+    rng = random if rng is None else rng
+    if '<think>\n\n</think>\n\n' in prompt_content and rng.random() > empty_think_ratio:
         prompt_content = prompt_content.replace('<think>\n\n</think>\n\n', '')
     return prompt_content
 
@@ -101,6 +448,9 @@ def post_processing_chat(prompt_content, empty_think_ratio=0.05):
 class PretrainDataset(Dataset):
     def __init__(self, data_path, tokenizer, max_length=512):
         super().__init__()
+        max_length = int(max_length)
+        if max_length < 2:
+            raise ValueError("Pretrain max_length must be at least 2")
         self.tokenizer = tokenizer      # 分词器，用于将文本转为token ID
         self.max_length = max_length    # 每条样本的最大token长度
         self.samples = self.load_data(data_path)  # 加载数据
@@ -135,26 +485,31 @@ class PretrainDataset(Dataset):
         sample = self.samples[index]
 
         # 将样本中的文本字段进行 tokenize
-        encoding = self.tokenizer(
-            str(sample['text']),                 # 转为字符串（确保数据类型一致）
-            max_length=self.max_length,          # 限制最大长度
-            padding='max_length',                # 不足部分补pad
-            truncation=True,                     # 超出部分截断
-            return_tensors='pt'                  # 返回PyTorch tensor形式（包含batch维度）
+        input_ids = self.tokenizer(
+            str(sample['text']), add_special_tokens=False
+        ).input_ids
+        eos_token_id = self.tokenizer.eos_token_id
+        if eos_token_id is None:
+            raise ValueError("pretraining requires a tokenizer EOS token")
+        if not input_ids or input_ids[-1] != eos_token_id:
+            input_ids.append(eos_token_id)
+        if len(input_ids) > self.max_length:
+            input_ids = input_ids[:self.max_length - 1] + [eos_token_id]
+        input_ids, attention_mask = _pad_token_ids(
+            input_ids, self.max_length, self.tokenizer.pad_token_id
         )
-
-        # 获取 input_ids 张量，并去除 batch 维度（变成一维）
-        input_ids = encoding.input_ids.squeeze()  # shape: [max_length]
         
         # 计算 loss_mask：pad 的位置不参与 loss
-        loss_mask = (input_ids != self.tokenizer.pad_token_id)  # shape: [max_length]，bool类型
+        loss_mask = [
+            token_id != self.tokenizer.pad_token_id for token_id in input_ids
+        ]
 
         # 语言模型是自回归的，使用前一个 token 预测下一个
         X = torch.tensor(input_ids[:-1], dtype=torch.long)         # 输入：[0, ..., n-2]
         Y = torch.tensor(input_ids[1:], dtype=torch.long)          # 目标：[1, ..., n-1]
         loss_mask = torch.tensor(loss_mask[1:], dtype=torch.long)  # loss_mask 对齐目标 Y
         # 对其 X ，提供注意力机制中的掩码
-        attention_mask = torch.tensor([1 if id != self.tokenizer.pad_token_id else 0 for id in input_ids[:-1]], dtype=torch.long)
+        attention_mask = torch.tensor(attention_mask[:-1], dtype=torch.long)
 
         return X, Y, loss_mask, attention_mask
     
@@ -233,38 +588,33 @@ class SFTDataset(Dataset):
         构建损失掩码，只有 assistant 的回答部分才参与 loss 计算。
         找出每一段 assistant 的响应，在其 <|im_start|>assistant 和 <|im_end|> 之间设置 loss_mask 为 1。
         """
-        loss_mask = [0] * len(input_ids)
-        i = 0
-        while i < len(input_ids):
-            # 找 assistant 开头标志
-            if input_ids[i:i + len(self.bos_id)] == self.bos_id:
-                start = i + len(self.bos_id) # 答案起点
-                end = start
-                while end < len(input_ids):
-                    # 查找 assistant 的回答终止符 <|im_end|>
-                    if input_ids[end:end + len(self.eos_id)] == self.eos_id:
-                        break
-                    end += 1
-                # 为 assistant 回答部分（从 start 到 end 之间）设置 loss mask
-                for j in range(start, min(end + len(self.eos_id), self.max_length)):
-                    loss_mask[j] = 1
-                # 跳过到下一个 segment
-                i = end + len(self.eos_id) if end < len(input_ids) else len(input_ids)
-            else:
-                i += 1
-        return loss_mask
+        return _assistant_loss_mask(
+            input_ids, self.bos_id, self.eos_id, self.max_length
+        )
 
     def __getitem__(self, index):
         sample = self.samples[index]
+        conversations = sample['conversations']
+        _reject_reserved_chatml_content(
+            conversations, f"SFT sample {index}"
+        )
 
         # 构建 ChatML 格式 prompt（字符串）
-        prompt = self._create_chat_prompt(sample['conversations'])
+        prompt = self._create_chat_prompt(conversations)
 
-        # 分词并截断，确保长度 <= max_length
-        input_ids = self.tokenizer(prompt, add_special_tokens=False).input_ids[:self.max_length]
-
-        # 右侧填充 pad_token 直到 max_length 长度
-        input_ids += [self.tokenizer.pad_token_id] * (self.max_length - len(input_ids))
+        input_ids = self.tokenizer(prompt, add_special_tokens=False).input_ids
+        _validate_chatml_start_boundaries(
+            input_ids,
+            self.bos_id[:1],
+            self.eos_id,
+            f"SFT sample {index}",
+        )
+        input_ids = _truncate_preserving_final_assistant(
+            input_ids, self.bos_id, self.eos_id, self.max_length
+        )
+        input_ids, attention_mask = _pad_token_ids(
+            input_ids, self.max_length, self.tokenizer.pad_token_id
+        )
 
         # 生成动态 loss mask，仅对 assistant 响应位置计算 loss
         loss_mask = self._generate_loss_mask(input_ids)
@@ -274,10 +624,14 @@ class SFTDataset(Dataset):
         X = torch.tensor(input_ids[:-1], dtype=torch.long)         # 输入序列
         Y = torch.tensor(input_ids[1:], dtype=torch.long)          # 目标标签（shifted）
         loss_mask = torch.tensor(loss_mask[1:], dtype=torch.long)  # 对齐 Y 的位置（从第一个预测 token 开始）
-        label_attention_mask = torch.tensor([1 if id != self.tokenizer.pad_token_id else 0 for id in input_ids[1:]], dtype=torch.long)
+        label_attention_mask = torch.tensor(attention_mask[1:], dtype=torch.long)
         loss_mask = loss_mask * label_attention_mask
+        if loss_mask.sum().item() == 0:
+            raise ValueError(
+                f"SFT sample {index} has no supervised assistant tokens after tokenization"
+            )
         # 对其 X ，提供注意力机制中的掩码
-        attention_mask = torch.tensor([1 if id != self.tokenizer.pad_token_id else 0 for id in input_ids[:-1]], dtype=torch.long)
+        attention_mask = torch.tensor(attention_mask[:-1], dtype=torch.long)
 
         return X, Y, loss_mask, attention_mask
 
@@ -328,6 +682,26 @@ class DPODataset(Dataset):
 
         chosen = item['chosen']
         rejected = item['rejected']
+        invalid_final_assistant = [
+            branch_name
+            for branch_name, conversation in (
+                ("chosen", chosen),
+                ("rejected", rejected),
+            )
+            if (
+                not isinstance(conversation, list)
+                or not conversation
+                or not isinstance(conversation[-1], dict)
+                or conversation[-1].get("role") != "assistant"
+            )
+        ]
+        if invalid_final_assistant:
+            branches = ", ".join(invalid_final_assistant)
+            raise ValueError(
+                f"DPO sample {index} {branches} must end with a final assistant message"
+            )
+        _reject_reserved_chatml_content(chosen, f"DPO sample {index} chosen")
+        _reject_reserved_chatml_content(rejected, f"DPO sample {index} rejected")
 
         # 拼接成字符串（不 tokenize，只生成 prompt 文本）
         chosen_prompt = self.tokenizer.apply_chat_template(
@@ -337,31 +711,37 @@ class DPODataset(Dataset):
             rejected, tokenize=False, add_generation_prompt=False
         )
 
-        # 编码为 input_ids（截断 + 填充）
-        chosen_encoding = self.tokenizer(
-            chosen_prompt,
-            truncation=True,
-            max_length=self.max_length,
-            padding='max_length',
-            add_special_tokens=False  # 已经在 apply_chat_template 中添加了特殊标记，不需要 tokenizer 再添加一次
+        chosen_input_ids = self.tokenizer(
+            chosen_prompt, add_special_tokens=False
+        ).input_ids
+        rejected_input_ids = self.tokenizer(
+            rejected_prompt, add_special_tokens=False
+        ).input_ids
+        _validate_chatml_start_boundaries(
+            chosen_input_ids,
+            self.bos_id[:1],
+            self.eos_id,
+            f"DPO sample {index} chosen",
         )
-        rejected_encoding = self.tokenizer(
-            rejected_prompt,
-            truncation=True,
-            max_length=self.max_length,
-            padding='max_length',
-            add_special_tokens=False  # 已经在 apply_chat_template 中添加了特殊标记，不需要 tokenizer 再添加一次
-
+        _validate_chatml_start_boundaries(
+            rejected_input_ids,
+            self.bos_id[:1],
+            self.eos_id,
+            f"DPO sample {index} rejected",
         )
-
-        # 转换为 token ID 列表，长度为 max_length
-        chosen_input_ids = chosen_encoding['input_ids'] # shape: (max_length,)
-        rejected_input_ids = rejected_encoding['input_ids'] # shape: (max_length,)
-
-        # 直接从 encoding 取出 attention_mask
-        # tokenizer 自动生成：真实token=1，PAD=0
-        chosen_attention_mask   = chosen_encoding['attention_mask']    # [max_length]
-        rejected_attention_mask = rejected_encoding['attention_mask']  # [max_length]
+        chosen_input_ids, rejected_input_ids = _truncate_dpo_pair(
+            chosen_input_ids,
+            rejected_input_ids,
+            self.bos_id,
+            self.eos_id,
+            self.max_length,
+        )
+        chosen_input_ids, chosen_attention_mask = _pad_token_ids(
+            chosen_input_ids, self.max_length, self.padding
+        )
+        rejected_input_ids, rejected_attention_mask = _pad_token_ids(
+            rejected_input_ids, self.max_length, self.padding
+        )
 
         # 构造 loss mask：仅在 assistant 段落（<|im_start|>assistant ... <|im_end|>）中的 token 参与损失
         chosen_loss_mask = self._generate_loss_mask(chosen_input_ids)     # shape: (max_length,)
@@ -376,6 +756,14 @@ class DPODataset(Dataset):
         x_rejected = torch.tensor(rejected_input_ids[:-1], dtype=torch.long)  # shape: (max_length - 1,)
         y_rejected = torch.tensor(rejected_input_ids[1:], dtype=torch.long)   # shape: (max_length - 1,)
         mask_rejected = torch.tensor(rejected_loss_mask[1:], dtype=torch.long) * torch.tensor(rejected_attention_mask[1:], dtype=torch.long) # shape: (max_length - 1,)
+        if mask_chosen.sum().item() == 0:
+            raise ValueError(
+                f"DPO sample {index} chosen branch has no supervised assistant tokens"
+            )
+        if mask_rejected.sum().item() == 0:
+            raise ValueError(
+                f"DPO sample {index} rejected branch has no supervised assistant tokens"
+            )
 
         # X = input_ids[:-1]，attention_mask 也取 [:-1]
         attention_mask_chosen = torch.tensor(chosen_attention_mask[:-1],   dtype=torch.long)
@@ -394,26 +782,9 @@ class DPODataset(Dataset):
         }
 
     def _generate_loss_mask(self, input_ids):
-        loss_mask = [0] * len(input_ids)
-        i = 0
-        while i < len(input_ids):
-            if input_ids[i:i + len(self.bos_id)] == self.bos_id:
-                start = i + len(self.bos_id)
-                end = start
-                while end < len(input_ids):
-                    if input_ids[end:end + len(self.eos_id)] == self.eos_id:
-                        break
-                    end += 1
-
-                # 改这里：start + 1 -> start
-                # 改这里：end + len(self.eos_id) + 1 -> end + len(self.eos_id)
-                for j in range(start, min(end + len(self.eos_id), self.max_length)):
-                    loss_mask[j] = 1
-
-                i = end + len(self.eos_id) if end < len(input_ids) else len(input_ids)
-            else:
-                i += 1
-        return loss_mask
+        return _assistant_loss_mask(
+            input_ids, self.bos_id, self.eos_id, self.max_length
+        )
     
 # ──────────────────────────────────────────────────────────────────────────────
 # 4. RLAIFDataset —— 基于 AI 反馈的强化学习数据集（用于 PPO / GRPO）
@@ -436,10 +807,12 @@ class DPODataset(Dataset):
 #     这是 RL 数据集与 SL 数据集（返回 tensor）的最显著差异。
 # ──────────────────────────────────────────────────────────────────────────────
 class RLAIFDataset(Dataset):
-    def __init__(self, file_path, tokenizer, max_length=1024):
+    def __init__(self, file_path, tokenizer, max_length=1024, seed=42):
         super().__init__()
         self.tokenizer = tokenizer
         self.max_length = max_length
+        self.seed = int(seed)
+        self.epoch = 0
         self.padding = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else 0
 
         # 特殊标记 <|im_start|>assistant 和 <|im_end|> 的 token ids（一般是开头和结尾的边界符）
@@ -457,7 +830,10 @@ class RLAIFDataset(Dataset):
     def __len__(self):
         return len(self.data)
 
-    def create_chat_prompt(self, conversations):
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch)
+
+    def create_chat_prompt(self, conversations, index=0):
         messages = []
         answer = ""
         for i, turn in enumerate(conversations):
@@ -471,7 +847,10 @@ class RLAIFDataset(Dataset):
             tokenize=False,
             add_generation_prompt=True,
         )
-        prompt = post_processing_chat(prompt)
+        sample_rng = random.Random(
+            self.seed + self.epoch * max(len(self.data), 1) + int(index)
+        )
+        prompt = post_processing_chat(prompt, rng=sample_rng)
         return prompt, answer
     
     def __getitem__(self, index):
@@ -486,7 +865,7 @@ class RLAIFDataset(Dataset):
             )
             return {"prompt": prompt, "answer": sample.get("answer", "")}
 
-        prompt, answer = self.create_chat_prompt(sample["conversations"])
+        prompt, answer = self.create_chat_prompt(sample["conversations"], index)
 
         return {"prompt": prompt, "answer": answer}
 

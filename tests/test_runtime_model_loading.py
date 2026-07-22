@@ -6,8 +6,9 @@ from pathlib import Path
 torch = pytest.importorskip("torch")
 from torch import nn
 
-from model.MiniMindModel import MiniMindConfig
+from model.MiniMindModel import MiniMindConfig, MiniMindForCausalLM
 from evals.core.load_model import load_model_and_tokenizer
+from trainer import train_ppo
 from trainer.train_ppo import CriticModel
 
 
@@ -24,6 +25,12 @@ class _BackboneWithFinalOutput(nn.Module):
 
     def norm(self, _hidden_states):
         raise AssertionError("Critic must not normalize the backbone final output twice")
+
+
+class _CompiledWrapper(nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self._orig_mod = model
 
 
 def test_ppo_critic_consumes_backbone_final_hidden_states_directly():
@@ -43,6 +50,33 @@ def test_ppo_critic_consumes_backbone_final_hidden_states_directly():
     assert values.shape == (1, 3)
 
 
+def test_ppo_critic_bootstraps_from_loaded_actor_instead_of_lossy_file():
+    helper = getattr(train_ppo, "initialize_critic_from_actor", None)
+    assert callable(helper)
+    config = MiniMindConfig(
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=1,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        vocab_size=32,
+    )
+    actor = MiniMindForCausalLM(config)
+    with torch.no_grad():
+        for index, parameter in enumerate(actor.parameters()):
+            parameter.fill_(index / 10)
+
+    critic = helper(config, _CompiledWrapper(actor), device="cpu")
+    critic_state = critic.state_dict()
+
+    assert all(
+        torch.equal(value, critic_state[name])
+        for name, value in actor.state_dict().items()
+    )
+    source = Path(train_ppo.__file__).read_text(encoding="utf-8-sig")
+    assert "initialize_critic_from_actor(lm_config, actor_model, args.device)" in source
+
+
 def test_explicit_missing_lora_path_raises_file_not_found(tmp_path):
     missing_lora = tmp_path / "missing-adapter.pth"
 
@@ -60,7 +94,6 @@ def test_explicit_missing_lora_path_raises_file_not_found(tmp_path):
     "eval.py",
     "eval/benchmark.py",
     "trainer/trainer_utils.py",
-    "trainer/train_ppo.py",
 ])
 def test_inference_weight_loaders_restrict_unpickling_to_weights(relative_path):
     source = Path(__file__).resolve().parents[1] / relative_path
